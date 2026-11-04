@@ -1,6 +1,6 @@
 # Receipt Manager / Belegverwaltung
 
-Desktop app (Windows, macOS, Linux) to store receipts as plain JSON files and get expense overviews.
+Vibe-coded Desktop app (Windows, macOS, Linux) to store receipts as plain JSON files and get expense overviews.
 English and German UI (switch in Settings; defaults to your system language).
 
 ## Run
