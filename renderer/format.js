@@ -79,9 +79,50 @@ export function parseQty(str) {
   return Number.isFinite(n) ? n : NaN;
 }
 
+// "19", "7,5", "10 %" -> number between 0 and 100. Empty -> null, invalid -> NaN.
+export function parsePercent(str) {
+  const s = String(str ?? '').replace('%', '').trim().replace(',', '.');
+  if (s === '') return null;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0 && n <= 100 ? n : NaN;
+}
+export function pctToInput(n) {
+  if (n === null || n === undefined || !Number.isFinite(Number(n))) return '';
+  return new Intl.NumberFormat(locale(), { maximumFractionDigits: 2, useGrouping: false }).format(n);
+}
+export const fmtPct = (n) => new Intl.NumberFormat(locale(), { maximumFractionDigits: 2 }).format(n);
+
+// ---- Calculation. Same maths as lib/receipts.js (test/logic.test.mjs checks that both agree). ----
+const rnd = (x) => { const v = Number(x.toFixed(6)); return v < 0 ? -Math.round(-v) : Math.round(v); };
+const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+const pctOrNull = (v) => {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+const clampPct = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 0; };
+
+export function itemLine(i) {
+  const gross = rnd(num(i.quantity) * num(i.unitPriceMinor));
+  return { gross, afterItem: rnd(gross * (100 - clampPct(i.discountPct)) / 100) };
+}
 export function receiptTotals(r) {
-  const subtotal = (r.items || []).reduce(
-    (sum, i) => sum + Math.round((Number(i.quantity) || 0) * (Number(i.unitPriceMinor) || 0)), 0);
-  const tax = Math.round(Number(r.taxMinor) || 0);
-  return { subtotal, tax, total: subtotal + (r.taxIncluded ? 0 : tax) };
+  const included = !!r.taxIncluded;
+  const recDisc = clampPct(r.discountPct);
+  let subtotal = 0; let itemDiscount = 0; let receiptDiscount = 0;
+  const groups = new Map();
+  for (const i of r.items || []) {
+    const { gross, afterItem } = itemLine(i);
+    const net = rnd(afterItem * (100 - recDisc) / 100);
+    subtotal += gross; itemDiscount += gross - afterItem; receiptDiscount += afterItem - net;
+    const rate = pctOrNull(i.taxRatePct) ?? 0;
+    groups.set(rate, (groups.get(rate) || 0) + net);
+  }
+  const taxByRate = [...groups.entries()].sort((a, b) => a[0] - b[0]).map(([rate, base]) => ({
+    rate, base, tax: included ? rnd(base * rate / (100 + rate)) : rnd(base * rate / 100),
+  }));
+  const legacyTax = Math.max(0, rnd(num(r.legacyTaxMinor)));
+  const base = taxByRate.reduce((s, g) => s + g.base, 0);
+  const tax = taxByRate.reduce((s, g) => s + g.tax, 0) + legacyTax;
+  return { subtotal, itemDiscount, receiptDiscount, taxByRate, legacyTax, tax, total: base + (included ? 0 : tax) };
 }
