@@ -5,9 +5,9 @@ const fs = require('fs');
 const fsp = fs.promises;
 const crypto = require('crypto');
 const chokidar = require('chokidar');
-const { FILE_RE, validateReceipt, sanitizeReceipt, newId } = require('./lib/receipts');
+const F = require('./lib/folder');
 
-const STORES_FILE = 'stores.json';
+const STORES_FILE = F.STORES_FILE;
 let mainWindow = null;
 let watcher = null;
 let config = { folder: null, language: null };
@@ -47,42 +47,15 @@ async function folderOk(folder) {
   try { await fsp.access(folder, fs.constants.R_OK | fs.constants.W_OK); return true; } catch { return false; }
 }
 async function getState() {
-  return { folder: config.folder, language: lang(), folderOk: await folderOk(config.folder) };
+  return { folder: config.folder, language: lang(), folderOk: await folderOk(config.folder), version: app.getVersion() };
 }
 
 // ---------- file helpers ----------
-async function writeJsonAtomic(file, data) {
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  await fsp.writeFile(tmp, JSON.stringify(data, null, 2) + '\n', 'utf8');
-  await fsp.rename(tmp, file);
-}
+const writeJsonAtomic = F.writeJsonAtomic;
 
-async function loadAll() {
-  const receipts = [];
-  const problems = [];
-  let names;
-  try { names = await fsp.readdir(config.folder); } catch (e) { return { receipts, problems, error: e.code || 'ERROR', names: [] }; }
-  for (const name of names) {
-    if (!name.toLowerCase().endsWith('.json') || name === STORES_FILE) continue;
-    try {
-      if (!FILE_RE.test(name)) throw new Error('file name is not a receipt ID (REC-YYYY-XXXXX.json)');
-      const data = JSON.parse(await fsp.readFile(path.join(config.folder, name), 'utf8'));
-      const err = validateReceipt(data);
-      if (err) throw new Error(err);
-      if (name !== `${data.id}.json`) throw new Error('file name does not match the ID inside');
-      receipts.push(data);
-    } catch (e) {
-      problems.push({ file: name, message: e.message });
-    }
-  }
-  return { receipts, problems, names };
-}
-
-function takenIds(names, receipts) {
-  const set = new Set(receipts.map(r => r.id));
-  names.forEach(n => set.add(n.replace(/\.json$/i, '')));
-  return set;
-}
+// All changes to the receipt folder run one after another, so renumbering never overlaps with a save or import.
+let queue = Promise.resolve();
+const exclusive = (fn) => { const run = queue.then(() => fn()); queue = run.catch(() => {}); return run; };
 
 // ---------- stores ----------
 async function readStores() {
@@ -138,7 +111,7 @@ ipcMain.handle('folder:choose', async () => {
 
   const old = config.folder;
   if (old && path.resolve(old) !== path.resolve(target) && (await folderOk(old))) {
-    const files = (await fsp.readdir(old)).filter(n => FILE_RE.test(n) || n === STORES_FILE);
+    const files = (await fsp.readdir(old)).filter(F.isReceiptFileName);
     if (files.length) {
       const m = msg();
       const choice = await dialog.showMessageBox(mainWindow, {
@@ -163,35 +136,21 @@ ipcMain.handle('folder:choose', async () => {
 
 ipcMain.handle('folder:open', () => (config.folder ? shell.openPath(config.folder) : ''));
 
-ipcMain.handle('receipts:list', async () => {
+ipcMain.handle('receipts:list', () => {
   if (!config.folder) return { receipts: [], problems: [] };
-  const { receipts, problems, error } = await loadAll();
-  return { receipts, problems, error };
+  // Reading also migrates 1.0 files and keeps IDs in order, so it runs in the same queue as writes.
+  return exclusive(() => F.refresh(config.folder));
 });
 
-ipcMain.handle('receipts:save', async (_e, input, existingId) => {
-  try {
-    const { receipts, names } = await loadAll();
-    let id = existingId;
-    let prev = null;
-    if (id) {
-      prev = receipts.find(r => r.id === id) || null;
-    } else {
-      id = newId(String(input.purchasedAt).slice(0, 4), takenIds(names, receipts));
-    }
-    const receipt = sanitizeReceipt(input, id, prev);
-    await writeJsonAtomic(path.join(config.folder, `${id}.json`), receipt);
-    return { receipt };
-  } catch (e) {
-    return { error: e.message };
-  }
-});
-
-ipcMain.handle('receipts:delete', async (_e, id) => {
-  if (!FILE_RE.test(`${id}.json`)) return { error: 'invalid id' };
-  try { await fsp.unlink(path.join(config.folder, `${id}.json`)); return { ok: true }; }
+ipcMain.handle('receipts:save', (_e, input, existingKey) => exclusive(async () => {
+  try { return { receipt: await F.saveReceipt(config.folder, input, existingKey) }; }
   catch (e) { return { error: e.message }; }
-});
+}));
+
+ipcMain.handle('receipts:delete', (_e, key) => exclusive(async () => {
+  try { await F.deleteReceipt(config.folder, key); return { ok: true }; }
+  catch (e) { return { error: e.message }; }
+}));
 
 ipcMain.handle('receipts:import', async () => {
   const res = await dialog.showOpenDialog(mainWindow, {
@@ -200,36 +159,7 @@ ipcMain.handle('receipts:import', async () => {
     filters: [{ name: 'JSON', extensions: ['json'] }],
   });
   if (res.canceled) return { canceled: true };
-  const out = { imported: 0, updated: 0, duplicates: 0, renumbered: 0, invalid: 0 };
-  const { receipts, names } = await loadAll();
-  const byId = new Map(receipts.map(r => [r.id, r]));
-  const taken = takenIds(names, receipts);
-  for (const file of res.filePaths) {
-    try {
-      const data = JSON.parse(await fsp.readFile(file, 'utf8'));
-      const err = validateReceipt(data);
-      if (err) throw new Error(err);
-      const existing = byId.get(data.id);
-      if (existing) {
-        if (existing.createdAt && existing.createdAt === data.createdAt) {
-          // Same receipt, possibly edited on another computer: keep the newer version.
-          if ((data.updatedAt || '') > (existing.updatedAt || '')) {
-            await writeJsonAtomic(path.join(config.folder, `${data.id}.json`), data);
-            byId.set(data.id, data); out.updated++;
-          } else { out.duplicates++; }
-          continue;
-        }
-        // Different receipt that happens to use the same ID: give it a new one.
-        data.id = newId(data.purchasedAt.slice(0, 4), taken);
-        out.renumbered++;
-      }
-      taken.add(data.id);
-      byId.set(data.id, data);
-      await writeJsonAtomic(path.join(config.folder, `${data.id}.json`), data);
-      out.imported++;
-    } catch { out.invalid++; }
-  }
-  return out;
+  return exclusive(() => F.importFiles(config.folder, res.filePaths));
 });
 
 ipcMain.handle('stores:list', async () => (config.folder ? readStores() : []));

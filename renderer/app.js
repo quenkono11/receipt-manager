@@ -1,5 +1,5 @@
 import { t, tp, setLang, getLang, locale } from './i18n.js';
-import { esc, fmtMoney, fmtDate, fmtDateTime, parseMoney, parseQty, minorToInput, nowLocal, todayISO, digits, receiptTotals } from './format.js';
+import { esc, fmtMoney, fmtDate, fmtDateTime, parseMoney, parseQty, parsePercent, pctToInput, fmtPct, minorToInput, nowLocal, todayISO, digits, receiptTotals, itemLine } from './format.js';
 import { buildReport, reportToCsv } from './reports.js';
 
 const api = window.api;
@@ -7,16 +7,16 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const S = {
-  folder: null, folderOk: true,
+  folder: null, folderOk: true, version: '',
   receipts: [], problems: [], stores: [],
-  view: 'list', selectedId: null, editing: null, storeEdit: null,
+  view: 'list', selectedKey: null, editing: null, storeEdit: null,
   filters: { q: '', from: '', to: '', store: '' },
   report: { period: 'month', from: `${new Date().getFullYear()}-01-01`, to: todayISO(), currency: '' },
 };
 
 // ---------- state ----------
 function applyState(st) {
-  S.folder = st.folder; S.folderOk = st.folderOk;
+  S.folder = st.folder; S.folderOk = st.folderOk; S.version = st.version || '';
   setLang(st.language);
   document.title = t('app.title');
 }
@@ -24,6 +24,7 @@ async function reload() {
   if (!S.folder) { S.receipts = []; S.stores = []; S.problems = []; return; }
   const r = await api.listReceipts();
   S.receipts = r.receipts || []; S.problems = r.problems || []; S.folderOk = !r.error;
+  if (r.migrated) toast(tp('toast.migrated', r.migrated));
   S.stores = await api.listStores();
 }
 async function init() {
@@ -33,7 +34,7 @@ async function init() {
   // Files copied into the folder (or changed elsewhere) show up automatically.
   api.onDataChanged(async () => {
     await reload();
-    if (S.view === 'detail' && !S.receipts.some((r) => r.id === S.selectedId)) S.view = 'list';
+    if (S.view === 'detail' && !S.receipts.some((r) => r.key === S.selectedKey)) S.view = 'list';
     if (S.view !== 'form' && S.view !== 'settings') render();
   });
 }
@@ -61,7 +62,7 @@ function render() {
     .map(([v, k]) => `<button class="nav-item${active === v ? ' active' : ''}" data-action="nav" data-view="${v}">${t(k)}</button>`).join('');
   const banner = S.folderOk ? '' : `<div class="banner error">${t('banner.folderMissing')}
     <button class="btn" data-action="chooseFolder">${t('banner.chooseFolder')}</button></div>`;
-  app.innerHTML = `<div class="shell"><aside class="side"><div class="brand">${t('app.title')}</div><nav>${nav}</nav></aside>
+  app.innerHTML = `<div class="shell"><aside class="side"><div class="brand">${t('app.title')}</div><nav>${nav}</nav>${S.version ? `<div class="side-foot muted">${t('side.version', { version: S.version })}</div>` : ''}</aside>
     <main class="main">${banner}${viewHtml()}</main></div>`;
   if (S.view === 'form') initForm();
 }
@@ -104,7 +105,7 @@ function listBodyHtml() {
   const sumText = Object.entries(sums).map(([c, m]) => fmtMoney(m, c)).join(' · ');
   return `<table class="table clickable"><thead><tr><th>${t('col.date')}</th><th>${t('col.id')}</th><th>${t('col.store')}</th>
     <th class="num">${t('col.items')}</th><th class="num">${t('col.total')}</th></tr></thead><tbody>
-    ${rows.map((r) => `<tr data-action="open" data-id="${esc(r.id)}"><td>${fmtDate(r.purchasedAt)}</td><td class="mono">${esc(r.id)}</td>
+    ${rows.map((r) => `<tr data-action="open" data-key="${esc(r.key)}"><td>${fmtDate(r.purchasedAt)}</td><td class="mono">${esc(r.id)}</td>
       <td>${storeLabel(r)}</td><td class="num">${r.items.length}</td><td class="num">${fmtMoney(receiptTotals(r).total, r.currency)}</td></tr>`).join('')}
     </tbody></table><p class="muted foot">${tp('list.count', rows.length)} · ${sumText}</p>`;
 }
@@ -124,32 +125,55 @@ function listHtml() {
 }
 
 // ---------- receipt detail ----------
+function slipSummaryHtml(r, tot, cur) {
+  const row = (label, value, cls = '') => `<tr class="${cls}"><td>${label}</td><td class="num">${value}</td></tr>`;
+  const rows = [row(t('detail.subtotal'), fmtMoney(tot.subtotal, cur))];
+  if (tot.itemDiscount) rows.push(row(t('form.itemDiscounts'), '−' + fmtMoney(tot.itemDiscount, cur)));
+  if (tot.receiptDiscount) rows.push(row(t('form.receiptDiscountLine', { pct: fmtPct(r.discountPct) }), '−' + fmtMoney(tot.receiptDiscount, cur)));
+  const taxRows = tot.taxByRate.filter((g) => g.rate > 0 || g.tax)
+    .map((g) => row(t(r.taxIncluded ? 'form.taxInclLine' : 'form.taxLine', { rate: fmtPct(g.rate) }), fmtMoney(g.tax, cur), r.taxIncluded ? 'incl' : ''));
+  if (tot.legacyTax) taxRows.push(row(t('form.taxFixedLine'), fmtMoney(tot.legacyTax, cur), r.taxIncluded ? 'incl' : ''));
+  if (!r.taxIncluded) rows.push(...taxRows);
+  rows.push(row(t('detail.total'), fmtMoney(tot.total, cur), 'grand'));
+  if (r.taxIncluded) rows.push(...taxRows);
+  return rows.join('');
+}
 function detailHtml() {
-  const r = S.receipts.find((x) => x.id === S.selectedId);
+  const r = S.receipts.find((x) => x.key === S.selectedKey);
   if (!r) return listHtml();
   const tot = receiptTotals(r); const cur = r.currency;
-  const items = r.items.length ? r.items.map((i) => `<tr><td>${esc(i.name)}${i.quantity !== 1 ? `<div class="muted">${i.quantity} × ${fmtMoney(i.unitPriceMinor, cur)}</div>` : ''}</td>
-    <td class="num">${fmtMoney(Math.round(i.quantity * i.unitPriceMinor), cur)}</td></tr>`).join('')
-    : `<tr><td class="muted">${t('detail.noItems')}</td><td></td></tr>`;
+  const items = r.items.length ? r.items.map((i) => {
+    const { afterItem } = itemLine(i);
+    const tags = [];
+    if (i.quantity !== 1) tags.push(`${i.quantity} × ${fmtMoney(i.unitPriceMinor, cur)}`);
+    if (i.discountPct) tags.push(t('detail.discount', { pct: fmtPct(i.discountPct) }));
+    if (i.taxRatePct !== null && i.taxRatePct !== undefined) tags.push(t('detail.rateTag', { rate: fmtPct(i.taxRatePct) }));
+    return `<tr><td>${esc(i.name)}${tags.length ? `<div class="muted">${esc(tags.join(' · '))}</div>` : ''}</td>
+    <td class="num">${fmtMoney(afterItem, cur)}</td></tr>`;
+  }).join('') : `<tr><td class="muted">${t('detail.noItems')}</td><td></td></tr>`;
   return `<header class="head"><div class="row"><button class="btn" data-action="nav" data-view="list">${t('common.back')}</button></div>
-    <div class="row"><button class="btn" data-action="edit" data-id="${esc(r.id)}">${t('common.edit')}</button>
-    <button class="btn danger" data-action="delete" data-id="${esc(r.id)}">${t('common.delete')}</button></div></header>
+    <div class="row"><button class="btn" data-action="edit" data-key="${esc(r.key)}">${t('common.edit')}</button>
+    <button class="btn danger" data-action="delete" data-key="${esc(r.key)}">${t('common.delete')}</button></div></header>
     <article class="slip"><div class="slip-head"><div class="slip-store">${esc(r.store.name)}</div>
     ${r.store.location ? `<div>${esc(r.store.location)}</div>` : ''}<div class="slip-meta">${fmtDateTime(r.purchasedAt)}</div>
     <div class="slip-meta mono">${esc(r.id)}</div></div>
     <table class="slip-items"><tbody>${items}</tbody></table>
-    <table class="slip-sum"><tbody><tr><td>${t('detail.subtotal')}</td><td class="num">${fmtMoney(tot.subtotal, cur)}</td></tr>
-    <tr><td>${r.taxIncluded ? t('detail.taxIncluded') : t('detail.taxAdded')}</td><td class="num">${fmtMoney(tot.tax, cur)}</td></tr>
-    <tr class="grand"><td>${t('detail.total')}</td><td class="num">${fmtMoney(tot.total, cur)}</td></tr></tbody></table>
+    <table class="slip-sum"><tbody>${slipSummaryHtml(r, tot, cur)}</tbody></table>
     ${r.notes ? `<div class="slip-notes"><strong>${t('detail.notes')}</strong><br>${esc(r.notes).replace(/\n/g, '<br>')}</div>` : ''}</article>`;
 }
 
 // ---------- receipt form ----------
-function itemRowHtml(item) {
-  const cur = (S.editing && S.editing.currency) || 'EUR';
+const TAX_RATES = [0, 7, 19];
+const lastRate = () => { const v = localStorage.getItem('lastTaxRate'); return v === null ? 19 : Number(v); };
+const emptyItem = (rate) => ({ name: '', quantity: 1, unitPriceMinor: 0, discountPct: 0, taxRatePct: rate });
+
+function itemRowHtml(item, cur) {
+  const dec = locale().startsWith('de') ? ',' : '.';
   return `<tr class="item-row"><td><input class="i-name" type="text" value="${esc(item.name)}" aria-label="${t('form.itemName')}"></td>
-    <td><input class="i-qty num" type="text" inputmode="decimal" value="${esc(String(item.quantity ?? 1).replace('.', locale().startsWith('de') ? ',' : '.'))}" aria-label="${t('form.qty')}"></td>
+    <td><input class="i-qty num" type="text" inputmode="decimal" value="${esc(String(item.quantity ?? 1).replace('.', dec))}" aria-label="${t('form.qty')}"></td>
     <td><input class="i-price num" type="text" inputmode="decimal" value="${item.unitPriceMinor ? esc(minorToInput(item.unitPriceMinor, cur)) : ''}" aria-label="${t('form.unitPrice')}"></td>
+    <td><input class="i-disc num" type="text" inputmode="decimal" value="${item.discountPct ? esc(pctToInput(item.discountPct)) : ''}" placeholder="0" aria-label="${t('form.discount')}"></td>
+    <td><input class="i-tax num" type="text" inputmode="decimal" list="taxList" value="${esc(pctToInput(item.taxRatePct))}" aria-label="${t('form.taxRate')}"></td>
     <td class="num i-line"></td>
     <td><button class="icon-btn" data-action="removeRow" title="${t('form.removeItem')}" aria-label="${t('form.removeItem')}">×</button></td></tr>`;
 }
@@ -159,11 +183,14 @@ function formHtml() {
   const match = r && S.stores.find((s) => s.name === r.store.name && (s.location || '') === (r.store.location || ''));
   const selNew = (r && !match) || (!r && !S.stores.length);
   const storeOpts = S.stores.map((s) => `<option value="${esc(s.id)}"${match && match.id === s.id ? ' selected' : ''}>${esc(s.name)}${s.location ? ' — ' + esc(s.location) : ''}</option>`).join('');
-  const items = r && r.items.length ? r.items : [{ name: '', quantity: 1, unitPriceMinor: 0 }];
+  const items = r && r.items.length ? r.items : [emptyItem(lastRate())];
+  const legacy = r && r.legacyTaxMinor ? `<div class="legacy"><label class="field narrow"><span>${t('form.legacyTax')}</span>
+    <input id="legacyTax" type="text" inputmode="decimal" class="num" value="${esc(minorToInput(r.legacyTaxMinor, cur))}"></label>
+    <p class="muted">${t('form.legacyTaxHelp')}</p></div>` : '';
   return `<header class="head"><h1>${r ? t('form.titleEdit', { id: r.id }) : t('form.titleNew')}</h1>
     <div class="row"><button class="btn" data-action="cancelForm">${t('common.cancel')}</button>
     <button class="btn primary" data-action="saveForm">${t('form.save')}</button></div></header>
-    ${r ? '' : `<p class="muted">${t('form.idNote')}</p>`}
+    <p class="muted">${t('form.idNote')}</p>
     <div id="receiptForm" class="form">
       <div class="grid2"><label class="field"><span>${t('form.store')}</span><select id="storeSel">
         ${selNew ? '' : `<option value="">${t('form.chooseStore')}</option>`}${storeOpts}
@@ -175,41 +202,86 @@ function formHtml() {
         <label class="check"><input id="saveStore" type="checkbox" checked> ${t('form.saveStore')}</label></div>
       <label class="field narrow"><span>${t('form.currency')}</span><input id="cur" type="text" maxlength="3" list="curList" value="${esc(cur)}">
         <datalist id="curList">${['EUR', 'USD', 'GBP', 'CHF', 'JPY', 'CAD', 'AUD', 'SEK', 'NOK', 'DKK', 'PLN', 'CZK'].map((c) => `<option value="${c}">`).join('')}</datalist></label>
+      <datalist id="taxList">${TAX_RATES.map((c) => `<option value="${c}">`).join('')}</datalist>
       <h2>${t('form.items')}</h2>
       <table id="items" class="table items"><thead><tr><th>${t('form.itemName')}</th><th class="num">${t('form.qty')}</th>
-        <th class="num">${t('form.unitPrice')}</th><th class="num">${t('form.lineTotal')}</th><th></th></tr></thead>
-        <tbody>${items.map(itemRowHtml).join('')}</tbody></table>
+        <th class="num">${t('form.unitPrice')}</th><th class="num">${t('form.discount')}</th><th class="num">${t('form.taxRate')}</th>
+        <th class="num">${t('form.lineTotal')}</th><th></th></tr></thead>
+        <tbody>${items.map((i) => itemRowHtml(i, cur)).join('')}</tbody></table>
       <button class="btn" data-action="addRow">${t('form.addItem')}</button>
-      <div class="grid2 tax-row"><label class="field"><span>${t('form.tax')}</span><input id="tax" type="text" inputmode="decimal" class="num" value="${r && r.taxMinor ? esc(minorToInput(r.taxMinor, cur)) : ''}"></label>
-        <label class="check"><input id="taxIncl" type="checkbox"${r && r.taxIncluded ? ' checked' : ''}> ${t('form.taxIncluded')}</label></div>
-      <dl class="sums"><dt>${t('form.subtotal')}</dt><dd id="sumSub"></dd><dt>${t('form.taxLine')}</dt><dd id="sumTax"></dd>
-        <dt class="grand">${t('form.total')}</dt><dd id="sumTotal" class="grand"></dd></dl>
+      <div class="grid2 tax-row"><label class="field narrow"><span>${t('form.receiptDiscount')}</span><input id="discPct" type="text" inputmode="decimal" class="num" placeholder="0" value="${r && r.discountPct ? esc(pctToInput(r.discountPct)) : ''}"></label>
+        <label class="check"><input id="taxIncl" type="checkbox"${!r || r.taxIncluded ? ' checked' : ''}> ${t('form.taxIncluded')}</label></div>
+      ${legacy}
+      <dl class="sums" id="sums"></dl>
       <label class="field"><span>${t('form.notes')}</span><textarea id="notes" rows="3">${esc(r ? r.notes : '')}</textarea></label>
     </div>`;
 }
 function initForm() { updateTotals(); }
+
+// Reads the form. `error` is the translation key of the first problem (used when saving);
+// for the live preview invalid fields simply count as empty.
+function readForm() {
+  const cur = $('#cur').value.trim().toUpperCase();
+  const parseCur = /^[A-Z]{3}$/.test(cur) ? cur : 'EUR';
+  let error = null;
+  const items = [];
+  for (const row of $$('#items .item-row')) {
+    const name = $('.i-name', row).value.trim();
+    const priceStr = $('.i-price', row).value.trim();
+    if (!name && !priceStr) continue;
+    const price = priceStr ? parseMoney(priceStr, parseCur) : 0;
+    const qty = parseQty($('.i-qty', row).value.trim() || '1');
+    const disc = parsePercent($('.i-disc', row).value);
+    const rate = parsePercent($('.i-tax', row).value);
+    if (price === null) error = error || 'err.price';
+    if (!(qty > 0)) error = error || 'err.qty';
+    if (Number.isNaN(disc) || Number.isNaN(rate)) error = error || 'err.percent';
+    items.push({
+      name, quantity: qty > 0 ? qty : 0, unitPriceMinor: price === null ? 0 : price,
+      discountPct: Number.isNaN(disc) || disc === null ? 0 : disc,
+      taxRatePct: Number.isNaN(rate) ? null : rate,
+    });
+  }
+  const discPct = parsePercent($('#discPct').value);
+  if (Number.isNaN(discPct)) error = error || 'err.percent';
+  let legacy = 0;
+  if ($('#legacyTax')) {
+    const l = $('#legacyTax').value.trim() ? parseMoney($('#legacyTax').value, parseCur) : 0;
+    if (l === null) error = error || 'err.price'; else legacy = l;
+  }
+  return {
+    cur, parseCur, error,
+    draft: { items, discountPct: Number.isNaN(discPct) || discPct === null ? 0 : discPct, taxIncluded: $('#taxIncl').checked, legacyTaxMinor: legacy },
+  };
+}
 function updateTotals() {
   if (!$('#receiptForm')) return;
-  const cur = $('#cur').value.trim().toUpperCase();
-  const dig = digits(cur || 'EUR');
-  const money = (m) => (/^[A-Z]{3}$/.test(cur) ? fmtMoney(m, cur) : (m / 10 ** dig).toFixed(dig));
-  let subtotal = 0;
+  const { cur, parseCur, draft } = readForm();
+  const valid = /^[A-Z]{3}$/.test(cur);
+  const money = (m) => (valid ? fmtMoney(m, cur) : (m / 10 ** digits(parseCur)).toFixed(digits(parseCur)));
   $$('#items .item-row').forEach((row) => {
+    const priceStr = $('.i-price', row).value.trim();
     const q = parseQty($('.i-qty', row).value.trim() || '1');
-    const p = parseMoney($('.i-price', row).value, cur || 'EUR');
-    const ok = Number.isFinite(q) && p !== null;
-    const line = ok ? Math.round(q * p) : 0;
-    subtotal += line;
-    $('.i-line', row).textContent = ok && $('.i-price', row).value.trim() ? money(line) : '';
+    const p = priceStr ? parseMoney(priceStr, parseCur) : null;
+    const d = parsePercent($('.i-disc', row).value);
+    $('.i-line', row).textContent = priceStr && p !== null && q > 0
+      ? money(itemLine({ quantity: q, unitPriceMinor: p, discountPct: Number.isNaN(d) ? 0 : d }).afterItem) : '';
   });
-  const taxStr = $('#tax').value.trim();
-  const tax = taxStr ? (parseMoney(taxStr, cur || 'EUR') || 0) : 0;
-  $('#sumSub').textContent = money(subtotal);
-  $('#sumTax').textContent = money(tax);
-  $('#sumTotal').textContent = money(subtotal + ($('#taxIncl').checked ? 0 : tax));
+  const tot = receiptTotals(draft);
+  const line = (label, value, cls = '') => `<dt class="${cls}">${label}</dt><dd class="${cls}">${value}</dd>`;
+  const out = [line(t('form.subtotal'), money(tot.subtotal))];
+  if (tot.itemDiscount) out.push(line(t('form.itemDiscounts'), '−' + money(tot.itemDiscount)));
+  if (tot.receiptDiscount) out.push(line(t('form.receiptDiscountLine', { pct: fmtPct(draft.discountPct) }), '−' + money(tot.receiptDiscount)));
+  const taxLines = tot.taxByRate.filter((g) => g.rate > 0 || g.tax)
+    .map((g) => line(t(draft.taxIncluded ? 'form.taxInclLine' : 'form.taxLine', { rate: fmtPct(g.rate) }), money(g.tax)));
+  if (tot.legacyTax) taxLines.push(line(t('form.taxFixedLine'), money(tot.legacyTax)));
+  if (!draft.taxIncluded) out.push(...taxLines);
+  out.push(line(t('form.total'), money(tot.total), 'grand'));
+  if (draft.taxIncluded) out.push(...taxLines);
+  $('#sums').innerHTML = out.join('');
 }
 async function saveForm() {
-  const cur = $('#cur').value.trim().toUpperCase();
+  const { cur, error, draft } = readForm();
   if (!/^[A-Z]{3}$/.test(cur)) return toast(t('err.currency'), true);
   const dt = $('#dt').value;
   if (!dt) return toast(t('err.date'), true);
@@ -226,31 +298,18 @@ async function saveForm() {
     store = { name: s.name, location: s.location || '' };
   } else return toast(t('err.store'), true);
 
-  const items = [];
-  for (const row of $$('#items .item-row')) {
-    const name = $('.i-name', row).value.trim();
-    const priceStr = $('.i-price', row).value.trim();
-    if (!name && !priceStr) continue;
-    const price = priceStr ? parseMoney(priceStr, cur) : 0;
-    const qty = parseQty($('.i-qty', row).value.trim() || '1');
-    if (price === null) return toast(t('err.price'), true);
-    if (!(qty > 0)) return toast(t('err.qty'), true);
-    items.push({ name, quantity: qty, unitPriceMinor: price });
-  }
-  if (!items.length) return toast(t('err.noItems'), true);
-  const taxStr = $('#tax').value.trim();
-  const tax = taxStr ? parseMoney(taxStr, cur) : 0;
-  if (tax === null) return toast(t('err.price'), true);
+  if (error) return toast(t(error), true);
+  if (!draft.items.length) return toast(t('err.noItems'), true);
 
-  const res = await api.saveReceipt({
-    store, purchasedAt: dt, currency: cur, items, taxMinor: tax,
-    taxIncluded: $('#taxIncl').checked, notes: $('#notes').value,
-  }, S.editing ? S.editing.id : null);
+  const res = await api.saveReceipt({ store, purchasedAt: dt, currency: cur, notes: $('#notes').value, ...draft },
+    S.editing ? S.editing.key : null);
   if (res.error) return toast(t('err.save', { message: res.error }), true);
   if (newStore) await api.upsertStore(newStore);
   localStorage.setItem('lastCurrency', cur);
+  const lastTax = [...draft.items].reverse().find((i) => i.taxRatePct !== null);
+  if (lastTax) localStorage.setItem('lastTaxRate', String(lastTax.taxRatePct));
   await reload();
-  S.selectedId = res.receipt.id; S.editing = null;
+  S.selectedKey = res.receipt.key; S.editing = null;
   go('detail');
   toast(t('toast.saved', { id: res.receipt.id }));
 }
@@ -313,24 +372,32 @@ function settingsHtml() {
     <div class="row"><button class="btn primary" data-action="chooseFolder">${t('settings.change')}</button>
     <button class="btn" data-action="openFolder">${t('settings.open')}</button>
     <button class="btn" data-action="import">${t('list.import')}</button></div></section>
-    <section class="card"><h2>${t('settings.language')}</h2>${langSelect()}</section>`;
+    <section class="card"><h2>${t('settings.language')}</h2>${langSelect()}</section>
+    <section class="card"><h2>${t('settings.version')}</h2><p class="mono">${esc(S.version)}</p></section>`;
 }
 
 // ---------- events ----------
 const actions = {
-  nav: (d) => { S.editing = null; S.storeEdit = null; go(d.view); },
+  // 'new' is not a view of its own: the sidebar entry opens an empty form (this was broken in 1.0).
+  nav: (d) => { S.editing = null; S.storeEdit = null; go(d.view === 'new' ? 'form' : d.view); },
   new: () => { S.editing = null; go('form'); },
-  open: (d) => { S.selectedId = d.id; go('detail'); },
-  edit: (d) => { S.editing = S.receipts.find((r) => r.id === d.id) || null; go('form'); },
-  cancelForm: () => { const back = S.editing ? 'detail' : 'list'; if (S.editing) S.selectedId = S.editing.id; S.editing = null; go(back); },
+  open: (d) => { S.selectedKey = d.key; go('detail'); },
+  edit: (d) => { S.editing = S.receipts.find((r) => r.key === d.key) || null; go('form'); },
+  cancelForm: () => { const back = S.editing ? 'detail' : 'list'; if (S.editing) S.selectedKey = S.editing.key; S.editing = null; go(back); },
   saveForm,
-  addRow: () => { $('#items tbody').insertAdjacentHTML('beforeend', itemRowHtml({ name: '', quantity: 1, unitPriceMinor: 0 })); $$('#items .i-name').pop().focus(); updateTotals(); },
+  addRow: () => {
+    const prev = $$('#items .i-tax').pop();
+    const rate = prev ? parsePercent(prev.value) : lastRate();
+    $('#items tbody').insertAdjacentHTML('beforeend', itemRowHtml(emptyItem(Number.isNaN(rate) ? null : rate), $('#cur').value.trim().toUpperCase() || 'EUR'));
+    $$('#items .i-name').pop().focus(); updateTotals();
+  },
   removeRow: (_d, el) => { if ($$('#items .item-row').length > 1) el.closest('tr').remove(); else el.closest('tr').querySelectorAll('input').forEach((i) => { i.value = ''; }); updateTotals(); },
   delete: async (d) => {
-    if (!confirm(t('detail.confirmDelete', { id: d.id }))) return;
-    const res = await api.deleteReceipt(d.id);
+    const r = S.receipts.find((x) => x.key === d.key);
+    if (!r || !confirm(t('detail.confirmDelete', { id: r.id }))) return;
+    const res = await api.deleteReceipt(d.key);
     if (res.error) return toast(res.error, true);
-    await reload(); go('list'); toast(t('toast.deleted', { id: d.id }));
+    await reload(); go('list'); toast(t('toast.deleted', { id: r.id }));
   },
   import: async () => {
     const res = await api.importReceipts();
@@ -381,6 +448,9 @@ document.addEventListener('input', (e) => {
     $('#listBody').innerHTML = listBodyHtml();
   }
   if (el.closest && el.closest('#receiptForm')) updateTotals();
+});
+document.addEventListener('focusin', (e) => {
+  if (e.target.classList && (e.target.classList.contains('i-tax') || e.target.classList.contains('i-disc'))) e.target.select();
 });
 document.addEventListener('change', async (e) => {
   const el = e.target;
