@@ -8,7 +8,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node test/logic.test.mjs",
-    "dist": "electron-builder"
+    "dist": "electron-builder --win --linux"
   },
   "dependencies": {
     "chokidar": "^3.6.0"
@@ -32,7 +32,7 @@
     },
     "win": {
       "target": [
-        "nsis"
+        "portable"
       ]
     },
     "linux": {
