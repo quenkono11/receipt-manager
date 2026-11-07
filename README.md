@@ -83,4 +83,4 @@ other tools; the app recalculates them from the items. Receipts converted from 1
 
 ## License
 
-GNU General Public License v3.0 (`GPL-3.0-only`). The full text is in `LICENSE`.
+GNU General Public License v3 (GPL v3). The full text is in `LICENSE`.

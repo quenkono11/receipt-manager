@@ -173,7 +173,7 @@ function itemRowHtml(item, cur) {
     <td><input class="i-qty num" type="text" inputmode="decimal" value="${esc(String(item.quantity ?? 1).replace('.', dec))}" aria-label="${t('form.qty')}"></td>
     <td><input class="i-price num" type="text" inputmode="decimal" value="${item.unitPriceMinor ? esc(minorToInput(item.unitPriceMinor, cur)) : ''}" aria-label="${t('form.unitPrice')}"></td>
     <td><input class="i-disc num" type="text" inputmode="decimal" value="${item.discountPct ? esc(pctToInput(item.discountPct)) : ''}" placeholder="0" aria-label="${t('form.discount')}"></td>
-    <td><input class="i-tax num" type="text" inputmode="decimal" list="taxList" value="${esc(pctToInput(item.taxRatePct))}" aria-label="${t('form.taxRate')}"></td>
+    <td><input class="i-tax num" type="text" inputmode="decimal" autocomplete="off" value="${esc(pctToInput(item.taxRatePct))}" aria-label="${t('form.taxRate')}"></td>
     <td class="num i-line"></td>
     <td><button class="icon-btn" data-action="removeRow" title="${t('form.removeItem')}" aria-label="${t('form.removeItem')}">×</button></td></tr>`;
 }
@@ -202,7 +202,7 @@ function formHtml() {
         <label class="check"><input id="saveStore" type="checkbox" checked> ${t('form.saveStore')}</label></div>
       <label class="field narrow"><span>${t('form.currency')}</span><input id="cur" type="text" maxlength="3" list="curList" value="${esc(cur)}">
         <datalist id="curList">${['EUR', 'USD', 'GBP', 'CHF', 'JPY', 'CAD', 'AUD', 'SEK', 'NOK', 'DKK', 'PLN', 'CZK'].map((c) => `<option value="${c}">`).join('')}</datalist></label>
-      <datalist id="taxList">${TAX_RATES.map((c) => `<option value="${c}">`).join('')}</datalist>
+      <div id="taxMenu" class="tax-menu" hidden></div>
       <h2>${t('form.items')}</h2>
       <table id="items" class="table items"><thead><tr><th>${t('form.itemName')}</th><th class="num">${t('form.qty')}</th>
         <th class="num">${t('form.unitPrice')}</th><th class="num">${t('form.discount')}</th><th class="num">${t('form.taxRate')}</th>
@@ -377,6 +377,22 @@ function settingsHtml() {
 }
 
 // ---------- events ----------
+// Tax-rate menu. The browser's own <datalist> hides every entry that does not match what is already typed
+// (with "19" in the field, 0 and 7 disappeared), so this small menu always lists all rates.
+const taxMenu = {
+  target: null,
+  open(input) {
+    const m = $('#taxMenu');
+    if (!m) return;
+    this.target = input;
+    m.innerHTML = TAX_RATES.map((r) => `<button type="button" data-action="pickTax" data-rate="${r}">${fmtPct(r)} %</button>`).join('');
+    const b = input.getBoundingClientRect();
+    m.style.left = `${b.left}px`; m.style.top = `${b.bottom + 2}px`; m.style.minWidth = `${b.width}px`;
+    m.hidden = false;
+  },
+  close() { const m = $('#taxMenu'); if (m) m.hidden = true; this.target = null; },
+};
+
 const actions = {
   // 'new' is not a view of its own: the sidebar entry opens an empty form (this was broken in 1.0).
   nav: (d) => { S.editing = null; S.storeEdit = null; go(d.view === 'new' ? 'form' : d.view); },
@@ -390,6 +406,13 @@ const actions = {
     const rate = prev ? parsePercent(prev.value) : lastRate();
     $('#items tbody').insertAdjacentHTML('beforeend', itemRowHtml(emptyItem(Number.isNaN(rate) ? null : rate), $('#cur').value.trim().toUpperCase() || 'EUR'));
     $$('#items .i-name').pop().focus(); updateTotals();
+  },
+  pickTax: (d) => {
+    const input = taxMenu.target;
+    if (!input) return;
+    input.value = pctToInput(Number(d.rate));
+    taxMenu.close();
+    input.dispatchEvent(new Event('input', { bubbles: true }));
   },
   removeRow: (_d, el) => { if ($$('#items .item-row').length > 1) el.closest('tr').remove(); else el.closest('tr').querySelectorAll('input').forEach((i) => { i.value = ''; }); updateTotals(); },
   delete: async (d) => {
@@ -436,6 +459,7 @@ const actions = {
 };
 
 document.addEventListener('click', async (e) => {
+  if (e.target.classList && e.target.classList.contains('i-tax')) taxMenu.open(e.target);
   const el = e.target.closest('[data-action]');
   if (!el) return;
   const fn = actions[el.dataset.action];
@@ -447,11 +471,19 @@ document.addEventListener('input', (e) => {
     S.filters[el.dataset.filter] = el.value;
     $('#listBody').innerHTML = listBodyHtml();
   }
+  if (el.classList && el.classList.contains('i-tax')) taxMenu.close();   // typing: hide the menu, a click shows it again
   if (el.closest && el.closest('#receiptForm')) updateTotals();
 });
 document.addEventListener('focusin', (e) => {
   if (e.target.classList && (e.target.classList.contains('i-tax') || e.target.classList.contains('i-disc'))) e.target.select();
+  if (e.target.classList && e.target.classList.contains('i-tax')) taxMenu.open(e.target);
 });
+document.addEventListener('focusout', (e) => { if (e.target.classList && e.target.classList.contains('i-tax')) taxMenu.close(); });
+// Pressing a menu entry must not take the focus away from the field, or the menu would close before the click.
+document.addEventListener('mousedown', (e) => { if (e.target.closest && e.target.closest('#taxMenu')) e.preventDefault(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') taxMenu.close(); });
+window.addEventListener('scroll', () => taxMenu.close(), true);
+window.addEventListener('resize', () => taxMenu.close());
 document.addEventListener('change', async (e) => {
   const el = e.target;
   if (el.id === 'langSel') { applyState(await api.setLanguage(el.value)); render(); }
