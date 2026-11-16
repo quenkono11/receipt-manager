@@ -1,40 +1,44 @@
 import { t, tp, setLang, getLang, locale } from './i18n.js';
 import { esc, fmtMoney, fmtDate, fmtDateTime, parseMoney, parseQty, parsePercent, pctToInput, fmtPct, minorToInput, nowLocal, todayISO, digits, receiptTotals, itemLine } from './format.js';
-import { buildReport, reportToCsv } from './reports.js';
+import { buildReport, receiptsToCsv, periodRange, shiftAnchor, periodKey, isoWeekStart } from './reports.js';
 
 const api = window.api;
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const S = {
-  folder: null, folderOk: true, version: '',
-  receipts: [], problems: [], stores: [],
-  view: 'list', selectedKey: null, editing: null, storeEdit: null,
+  folder: null, folderOk: true, version: '', theme: 'system', checkUpdates: true, updateRepo: false, update: null,
+  receipts: [], problems: [], stores: [], categories: [],
+  view: 'list', backView: 'list', selectedKey: null, editing: null, storeEdit: null, catEdit: null,
   filters: { q: '', from: '', to: '', store: '' },
-  report: { period: 'month', from: `${new Date().getFullYear()}-01-01`, to: todayISO(), currency: '' },
+  report: { period: 'month', anchor: todayISO(), currency: '' },
 };
 
 // ---------- state ----------
 function applyState(st) {
   S.folder = st.folder; S.folderOk = st.folderOk; S.version = st.version || '';
+  S.theme = st.theme || 'system'; S.checkUpdates = st.checkUpdates !== false; S.updateRepo = !!st.updateRepo; S.update = st.update || null;
   setLang(st.language);
   document.title = t('app.title');
 }
 async function reload() {
-  if (!S.folder) { S.receipts = []; S.stores = []; S.problems = []; return; }
+  if (!S.folder) { S.receipts = []; S.stores = []; S.categories = []; S.problems = []; return; }
   const r = await api.listReceipts();
   S.receipts = r.receipts || []; S.problems = r.problems || []; S.folderOk = !r.error;
   if (r.migrated) toast(tp('toast.migrated', r.migrated));
   S.stores = await api.listStores();
+  S.categories = await api.listCategories();
 }
 async function init() {
+  // Registered first, so an answer that arrives while the app is still loading is not missed.
+  api.onUpdateInfo((info) => { S.update = info || null; refreshUpdateNote(); });
   applyState(await api.getState());
   await reload();
   render();
   // Files copied into the folder (or changed elsewhere) show up automatically.
   api.onDataChanged(async () => {
     await reload();
-    if (S.view === 'detail' && !S.receipts.some((r) => r.key === S.selectedKey)) S.view = 'list';
+    if (S.view === 'detail' && !S.receipts.some((r) => r.key === S.selectedKey)) S.view = S.backView;
     if (S.view !== 'form' && S.view !== 'settings') render();
   });
 }
@@ -49,6 +53,11 @@ function toast(message, isError = false) {
   toastTimer = setTimeout(() => { el.hidden = true; }, 5000);
 }
 const go = (view) => { S.view = view; render(); window.scrollTo(0, 0); };
+
+// "Version x.y.z is available" next to the version number (sidebar and settings); opens the release page.
+const updateNoteHtml = () => (S.update
+  ? `<button type="button" class="link-btn" data-action="openRelease">${esc(t('update.available', { version: S.update.version }))}</button>` : '');
+const refreshUpdateNote = () => $$('[data-update-slot]').forEach((el) => { el.innerHTML = updateNoteHtml(); });
 const langSelect = () => `<label class="field inline"><span>${t('settings.language')}</span>
   <select id="langSel"><option value="en"${getLang() === 'en' ? ' selected' : ''}>English</option>
   <option value="de"${getLang() === 'de' ? ' selected' : ''}>Deutsch</option></select></label>`;
@@ -57,12 +66,12 @@ const langSelect = () => `<label class="field inline"><span>${t('settings.langua
 function render() {
   const app = $('#app');
   if (!S.folder) { app.innerHTML = setupHtml(); return; }
-  const active = S.view === 'detail' ? 'list' : S.view === 'form' ? (S.editing ? 'list' : 'new') : S.view;
-  const nav = [['list', 'nav.list'], ['new', 'nav.new'], ['report', 'nav.report'], ['stores', 'nav.stores'], ['settings', 'nav.settings']]
+  const active = S.view === 'detail' ? S.backView : S.view === 'form' ? (S.editing ? 'list' : 'new') : S.view;
+  const nav = [['list', 'nav.list'], ['new', 'nav.new'], ['report', 'nav.report'], ['stores', 'nav.stores'], ['categories', 'nav.categories'], ['settings', 'nav.settings']]
     .map(([v, k]) => `<button class="nav-item${active === v ? ' active' : ''}" data-action="nav" data-view="${v}">${t(k)}</button>`).join('');
   const banner = S.folderOk ? '' : `<div class="banner error">${t('banner.folderMissing')}
     <button class="btn" data-action="chooseFolder">${t('banner.chooseFolder')}</button></div>`;
-  app.innerHTML = `<div class="shell"><aside class="side"><div class="brand">${t('app.title')}</div><nav>${nav}</nav>${S.version ? `<div class="side-foot muted">${t('side.version', { version: S.version })}</div>` : ''}</aside>
+  app.innerHTML = `<div class="shell"><aside class="side"><div class="brand">${t('app.title')}</div><nav>${nav}</nav>${S.version ? `<div class="side-foot muted"><div>${t('side.version', { version: S.version })}</div><div data-update-slot>${updateNoteHtml()}</div></div>` : ''}</aside>
     <main class="main">${banner}${viewHtml()}</main></div>`;
   if (S.view === 'form') initForm();
 }
@@ -72,6 +81,7 @@ function viewHtml() {
     case 'form': return formHtml();
     case 'report': return reportHtml();
     case 'stores': return storesHtml();
+    case 'categories': return categoriesHtml();
     case 'settings': return settingsHtml();
     default: return listHtml();
   }
@@ -92,7 +102,7 @@ function filteredReceipts() {
     if (f.to && d > f.to) return false;
     if (f.store && (r.store && r.store.name) !== f.store) return false;
     if (!q) return true;
-    const hay = [r.id, r.store && r.store.name, r.store && r.store.location, r.notes, ...r.items.map((i) => i.name)].join(' ').toLowerCase();
+    const hay = [r.id, r.store && r.store.name, r.store && r.store.location, r.notes, ...r.items.map((i) => i.name), ...r.items.map((i) => i.category)].join(' ').toLowerCase();
     return hay.includes(q);
   }).sort((a, b) => (a.purchasedAt === b.purchasedAt ? (a.id < b.id ? 1 : -1) : a.purchasedAt < b.purchasedAt ? 1 : -1));
 }
@@ -145,13 +155,14 @@ function detailHtml() {
   const items = r.items.length ? r.items.map((i) => {
     const { afterItem } = itemLine(i);
     const tags = [];
+    if (i.category) tags.push(i.category);
     if (i.quantity !== 1) tags.push(`${i.quantity} × ${fmtMoney(i.unitPriceMinor, cur)}`);
     if (i.discountPct) tags.push(t('detail.discount', { pct: fmtPct(i.discountPct) }));
     if (i.taxRatePct !== null && i.taxRatePct !== undefined) tags.push(t('detail.rateTag', { rate: fmtPct(i.taxRatePct) }));
     return `<tr><td>${esc(i.name)}${tags.length ? `<div class="muted">${esc(tags.join(' · '))}</div>` : ''}</td>
     <td class="num">${fmtMoney(afterItem, cur)}</td></tr>`;
   }).join('') : `<tr><td class="muted">${t('detail.noItems')}</td><td></td></tr>`;
-  return `<header class="head"><div class="row"><button class="btn" data-action="nav" data-view="list">${t('common.back')}</button></div>
+  return `<header class="head"><div class="row"><button class="btn" data-action="nav" data-view="${S.backView}">${t('common.back')}</button></div>
     <div class="row"><button class="btn" data-action="edit" data-key="${esc(r.key)}">${t('common.edit')}</button>
     <button class="btn danger" data-action="delete" data-key="${esc(r.key)}">${t('common.delete')}</button></div></header>
     <article class="slip"><div class="slip-head"><div class="slip-store">${esc(r.store.name)}</div>
@@ -165,11 +176,21 @@ function detailHtml() {
 // ---------- receipt form ----------
 const TAX_RATES = [0, 7, 19];
 const lastRate = () => { const v = localStorage.getItem('lastTaxRate'); return v === null ? 19 : Number(v); };
-const emptyItem = (rate) => ({ name: '', quantity: 1, unitPriceMinor: 0, discountPct: 0, taxRatePct: rate });
+const emptyItem = (rate, category = '') => ({ name: '', category, quantity: 1, unitPriceMinor: 0, discountPct: 0, taxRatePct: rate });
 
 function itemRowHtml(item, cur) {
   const dec = locale().startsWith('de') ? ',' : '.';
+  const cat = item.category || '';
+  const catOpts = S.categories.map((c) => `<option value="${esc(c.name)}"${c.name === cat ? ' selected' : ''}>${esc(c.name)}</option>`).join('');
+  const newSelected = cat && !S.categories.some((c) => c.name === cat);
   return `<tr class="item-row"><td><input class="i-name" type="text" value="${esc(item.name)}" aria-label="${t('form.itemName')}"></td>
+    <td class="i-cat-cell"><select class="i-cat" autocomplete="off" aria-label="${t('form.category')}">
+      <option value="">${t('form.chooseCategory')}</option>${catOpts}
+      <option value="__new__"${newSelected ? ' selected' : ''}>${t('form.newCategory')}</option></select>
+    <div class="i-cat-newblk"${newSelected ? '' : ' hidden'}>
+      <input class="i-cat-new" type="text" autocomplete="off" value="${esc(cat)}" aria-label="${t('form.category')}">
+      <label class="check"><input type="checkbox" checked> ${t('form.saveCategory')}</label>
+    </div></td>
     <td><input class="i-qty num" type="text" inputmode="decimal" value="${esc(String(item.quantity ?? 1).replace('.', dec))}" aria-label="${t('form.qty')}"></td>
     <td><input class="i-price num" type="text" inputmode="decimal" value="${item.unitPriceMinor ? esc(minorToInput(item.unitPriceMinor, cur)) : ''}" aria-label="${t('form.unitPrice')}"></td>
     <td><input class="i-disc num" type="text" inputmode="decimal" value="${item.discountPct ? esc(pctToInput(item.discountPct)) : ''}" placeholder="0" aria-label="${t('form.discount')}"></td>
@@ -202,9 +223,9 @@ function formHtml() {
         <label class="check"><input id="saveStore" type="checkbox" checked> ${t('form.saveStore')}</label></div>
       <label class="field narrow"><span>${t('form.currency')}</span><input id="cur" type="text" maxlength="3" list="curList" value="${esc(cur)}">
         <datalist id="curList">${['EUR', 'USD', 'GBP', 'CHF', 'JPY', 'CAD', 'AUD', 'SEK', 'NOK', 'DKK', 'PLN', 'CZK'].map((c) => `<option value="${c}">`).join('')}</datalist></label>
-      <div id="taxMenu" class="tax-menu" hidden></div>
+      <div id="comboMenu" class="combo-menu" hidden></div>
       <h2>${t('form.items')}</h2>
-      <table id="items" class="table items"><thead><tr><th>${t('form.itemName')}</th><th class="num">${t('form.qty')}</th>
+      <table id="items" class="table items"><thead><tr><th>${t('form.itemName')}</th><th>${t('form.category')}</th><th class="num">${t('form.qty')}</th>
         <th class="num">${t('form.unitPrice')}</th><th class="num">${t('form.discount')}</th><th class="num">${t('form.taxRate')}</th>
         <th class="num">${t('form.lineTotal')}</th><th></th></tr></thead>
         <tbody>${items.map((i) => itemRowHtml(i, cur)).join('')}</tbody></table>
@@ -236,10 +257,14 @@ function readForm() {
     if (price === null) error = error || 'err.price';
     if (!(qty > 0)) error = error || 'err.qty';
     if (Number.isNaN(disc) || Number.isNaN(rate)) error = error || 'err.percent';
+    const catSel = $('.i-cat', row);
+    let category = catSel.value === '__new__' ? ($('.i-cat-new', row).value.trim()) : catSel.value;
+    const catSave = catSel.value === '__new__' ? $('.i-cat-newblk .check input', row).checked : false;
     items.push({
-      name, quantity: qty > 0 ? qty : 0, unitPriceMinor: price === null ? 0 : price,
+      name, category: canonicalCategory(category), quantity: qty > 0 ? qty : 0, unitPriceMinor: price === null ? 0 : price,
       discountPct: Number.isNaN(disc) || disc === null ? 0 : disc,
       taxRatePct: Number.isNaN(rate) ? null : rate,
+      _newCategory: catSave ? canonicalCategory(category) : null,
     });
   }
   const discPct = parsePercent($('#discPct').value);
@@ -301,10 +326,15 @@ async function saveForm() {
   if (error) return toast(t(error), true);
   if (!draft.items.length) return toast(t('err.noItems'), true);
 
+  // A new category typed in an item row must have a name before the receipt is saved.
+  const newCats = [...new Set((draft.items.map((i) => i._newCategory).filter(Boolean)))];
+  for (const c of newCats) if (!c) return toast(t('err.category'), true);
+
   const res = await api.saveReceipt({ store, purchasedAt: dt, currency: cur, notes: $('#notes').value, ...draft },
     S.editing ? S.editing.key : null);
   if (res.error) return toast(t('err.save', { message: res.error }), true);
   if (newStore) await api.upsertStore(newStore);
+  for (const c of newCats) await api.upsertCategory({ name: c });
   localStorage.setItem('lastCurrency', cur);
   const lastTax = [...draft.items].reverse().find((i) => i.taxRatePct !== null);
   if (lastTax) localStorage.setItem('lastTaxRate', String(lastTax.taxRatePct));
@@ -315,39 +345,110 @@ async function saveForm() {
 }
 
 // ---------- overview ----------
-function periodLabel(key, period) {
-  if (period === 'day') return fmtDate(key);
-  if (period === 'week') { const [y, w] = key.split('-W'); return t('rep.weekLabel', { w: +w, y }); }
-  if (period === 'month') { const [y, m] = key.split('-').map(Number); return new Intl.DateTimeFormat(locale(), { month: 'long', year: 'numeric' }).format(new Date(y, m - 1, 1)); }
-  if (period === 'quarter') { const [y, q] = key.split('-'); return `${q} ${y}`; }
-  return key;
+// The overview shows ONE chosen period: pick Day / Week / Month / Quarter / Year, then the specific one.
+const PERIODS = ['day', 'week', 'month', 'quarter', 'year'];
+const DRILL = { week: 'day', month: 'day', quarter: 'month', year: 'month' };   // clicking a bar opens that day or month
+const dateOf = (iso) => { const [y, m, d] = iso.split('-').map(Number); return new Date(y, m - 1, d); };
+
+function periodTitle(period, range) {
+  const [y, m] = range.from.split('-').map(Number);
+  switch (period) {
+    case 'day': return new Intl.DateTimeFormat(locale(), { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(dateOf(range.from));
+    case 'week': { const [wy, w] = periodKey(range.from, 'week').split('-W'); return t('rep.weekLabel', { w: Number(w), y: wy }); }
+    case 'month': return new Intl.DateTimeFormat(locale(), { month: 'long', year: 'numeric' }).format(new Date(y, m - 1, 1));
+    case 'quarter': return `Q${Math.ceil(m / 3)} ${y}`;
+    default: return String(y);
+  }
 }
-function currentReport() { return buildReport(S.receipts, S.report); }
+const bucketLabel = (period, b) => (period === 'week'
+  ? new Intl.DateTimeFormat(locale(), { weekday: 'short' }).format(dateOf(b.key))
+  : period === 'month' ? String(Number(b.key.slice(8)))
+    : new Intl.DateTimeFormat(locale(), { month: 'short' }).format(dateOf(b.from)));
+const bucketTitle = (period, b) => (period === 'week' || period === 'month'
+  ? fmtDate(b.key) : new Intl.DateTimeFormat(locale(), { month: 'long', year: 'numeric' }).format(dateOf(b.from)));
+const fmtChange = (x) => new Intl.NumberFormat(locale(), { style: 'percent', maximumFractionDigits: 0, signDisplay: 'exceptZero' }).format(x);
+
+function yearSelect(field, y) {
+  const now = new Date().getFullYear();
+  const years = S.receipts.map((r) => Number(r.purchasedAt.slice(0, 4)));
+  const lo = Math.min(y, now, ...years); const hi = Math.max(y, now, ...years);
+  let opts = '';
+  for (let v = lo; v <= hi; v++) opts += `<option${v === y ? ' selected' : ''}>${v}</option>`;
+  return `<select data-rep="${field}" aria-label="${t('rep.year')}">${opts}</select>`;
+}
+function pickerHtml(period, range) {
+  const [y, m] = range.from.split('-').map(Number);
+  switch (period) {
+    case 'day': return `<input type="date" data-rep="anchor" value="${range.from}">`;
+    case 'week': return `<input type="week" data-rep="week" value="${periodKey(range.from, 'week')}">`;
+    case 'month': return `<input type="month" data-rep="month" value="${range.from.slice(0, 7)}">`;
+    case 'quarter': return `<select data-rep="quarter" aria-label="${t('rep.quarter')}">${[1, 2, 3, 4].map((q) =>
+      `<option value="${q}"${q === Math.ceil(m / 3) ? ' selected' : ''}>Q${q}</option>`).join('')}</select>${yearSelect('qyear', y)}`;
+    default: return yearSelect('year', y);
+  }
+}
+// A control of the overview changed: turn its value into a date inside the chosen period.
+function setReport(field, v) {
+  const R = S.report;
+  const [y, m] = periodRange(R.period, R.anchor).from.split('-').map(Number);
+  const p2 = (n) => String(n).padStart(2, '0');
+  if (field === 'currency') R.currency = v;
+  else if (field === 'anchor') { if (v) R.anchor = v; }
+  else if (field === 'week') { const mm = /^(\d{4})-W(\d{2})$/.exec(v); if (mm) R.anchor = isoWeekStart(Number(mm[1]), Number(mm[2])); }
+  else if (field === 'month') { if (/^\d{4}-\d{2}$/.test(v)) R.anchor = `${v}-01`; }
+  else if (field === 'quarter') R.anchor = `${y}-${p2((Number(v) - 1) * 3 + 1)}-01`;
+  else if (field === 'qyear') R.anchor = `${v}-${p2(m)}-01`;
+  else if (field === 'year') R.anchor = `${v}-01-01`;
+  render();
+}
+
 function reportHtml() {
-  const R = currentReport(); const p = S.report.period; const cur = R.currency;
-  const periods = ['day', 'week', 'month', 'quarter', 'year'];
-  const controls = `<div class="filters">
-    <label class="field inline"><span>${t('rep.groupBy')}</span><select data-rep="period">${periods.map((x) => `<option value="${x}"${x === p ? ' selected' : ''}>${t('rep.' + x)}</option>`).join('')}</select></label>
-    <label class="field inline"><span>${t('rep.from')}</span><input type="date" data-rep="from" value="${esc(S.report.from)}"></label>
-    <label class="field inline"><span>${t('rep.to')}</span><input type="date" data-rep="to" value="${esc(S.report.to)}"></label>
-    ${R.currencies.length ? `<label class="field inline"><span>${t('rep.currency')}</span><select data-rep="currency">${R.currencies.map((c) => `<option${c.code === cur ? ' selected' : ''}>${esc(c.code)}</option>`).join('')}</select></label>` : ''}</div>`;
-  const head = `<header class="head"><h1>${t('rep.title')}</h1><div class="row">${R.rows.length ? `<button class="btn" data-action="exportCsv">${t('rep.export')}</button>` : ''}</div></header>`;
-  if (!R.rows.length) return `${head}${controls}<p class="empty">${t('rep.noData')}</p>`;
-  const max = Math.max(...R.rows.map((r) => r.totalMinor), 1);
-  const stat = (label, value) => `<div class="stat"><div class="stat-label">${label}</div><div class="stat-value">${value}</div></div>`;
+  const R = buildReport(S.receipts, S.report); const p = S.report.period; const cur = R.currency;
+  const seg = PERIODS.map((x) => `<button type="button" class="seg-btn${x === p ? ' on' : ''}" data-action="repPeriod" data-period="${x}" aria-pressed="${x === p}">${t('rep.' + x)}</button>`).join('');
+  const sub = p === 'week' || p === 'quarter' ? ` <span class="muted">${esc(fmtDate(R.range.from))} – ${esc(fmtDate(R.range.to))}</span>` : '';
+  const controls = `<div class="period-bar"><div class="seg" role="group">${seg}</div>
+    <div class="row"><button class="btn" data-action="repPrev" title="${t('rep.prev')}" aria-label="${t('rep.prev')}">◀</button>${pickerHtml(p, R.range)}
+    <button class="btn" data-action="repNext" title="${t('rep.next')}" aria-label="${t('rep.next')}">▶</button>
+    <button class="btn" data-action="repToday">${t('rep.today.' + p)}</button></div>
+    ${R.currencies.length ? `<label class="field inline"><span>${t('rep.currency')}</span><select data-rep="currency">${R.currencies.map((c) => `<option${c.code === cur ? ' selected' : ''}>${esc(c.code)}</option>`).join('')}</select></label>` : ''}</div>
+    <h2 class="period-title">${esc(periodTitle(p, R.range))}${sub}</h2>`;
+  const head = `<header class="head"><h1>${t('rep.title')}</h1><div class="row">${R.receipts.length ? `<button class="btn" data-action="exportCsv">${t('rep.export')}</button>` : ''}</div></header>`;
+  if (!R.receipts.length) return `${head}${controls}<p class="empty">${t('rep.noData')}</p>`;
+
+  const stat = (label, value, extra = '') => `<div class="stat"><div class="stat-label">${label}</div><div class="stat-value">${value}</div>${extra}</div>`;
+  const vsPrev = R.previous.totalMinor > 0
+    ? `<div class="stat-sub muted">${esc(t('rep.vsPrev', { change: fmtChange((R.totals.totalMinor - R.previous.totalMinor) / R.previous.totalMinor), period: periodTitle(p, R.previous.range) }))}</div>` : '';
+  const share = (v, whole) => (whole > 0 ? `${Math.round((v / whole) * 100)} %` : '');
+
+  let chart = '';
+  if (R.buckets.length) {
+    const max = Math.max(...R.buckets.map((b) => b.totalMinor), 1);
+    chart = `<h2>${t(p === 'quarter' || p === 'year' ? 'rep.byMonth' : 'rep.byDay')}</h2><div class="cols" style="--n:${R.buckets.length}">${R.buckets.map((b) => {
+      const tip = `${bucketTitle(p, b)}: ${fmtMoney(b.totalMinor, cur)}${b.count ? ` · ${tp('list.count', b.count)}` : ''}`;
+      return `<button type="button" class="col" data-action="repDrill" data-period="${DRILL[p]}" data-anchor="${b.from}" title="${esc(tip)}">
+        <span class="col-area"><span class="col-bar${b.totalMinor > 0 ? '' : ' zero'}" style="height:${Math.max(0, (b.totalMinor / max) * 100).toFixed(1)}%"></span></span>
+        <span class="col-label">${esc(bucketLabel(p, b))}</span></button>`;
+    }).join('')}</div>`;
+  }
+
+  const catSum = R.byCategory.reduce((s, c) => s + c.totalMinor, 0);
+  const byCategory = R.byCategory.length ? `<h2>${t('rep.byCategory')}</h2>
+    <table class="table"><thead><tr><th>${t('form.category')}</th><th class="num">${t('rep.share')}</th><th class="num">${t('col.total')}</th></tr></thead><tbody>
+    ${R.byCategory.map((c) => `<tr><td>${c.name ? esc(c.name) : `<span class="muted">${t('rep.uncategorized')}</span>`}</td><td class="num">${share(c.totalMinor, catSum)}</td><td class="num">${fmtMoney(c.totalMinor, cur)}</td></tr>`).join('')}</tbody></table>
+    <p class="muted foot">${t('rep.categoryNote')}</p>` : '';
+
   return `${head}${controls}
-    <div class="stats">${stat(t('rep.spent'), fmtMoney(R.totals.totalMinor, cur))}${stat(t('rep.tax'), fmtMoney(R.totals.taxMinor, cur))}
+    <div class="stats">${stat(t('rep.spent'), fmtMoney(R.totals.totalMinor, cur), vsPrev)}${stat(t('rep.tax'), fmtMoney(R.totals.taxMinor, cur))}
     ${stat(t('rep.receipts'), R.totals.count)}${stat(t('rep.average'), fmtMoney(R.average, cur))}</div>
     ${R.currencies.length > 1 ? `<p class="muted">${t('rep.otherCurrencies')}</p>` : ''}
-    <h2>${t('rep.byPeriod')}</h2>
-    <div class="chart">${R.rows.map((r) => `<div class="bar-row"><span class="bar-label">${esc(periodLabel(r.key, p))}</span>
-      <span class="bar-track"><span class="bar" style="width:${Math.max(0, (r.totalMinor / max) * 100).toFixed(1)}%"></span></span>
-      <span class="bar-val">${fmtMoney(r.totalMinor, cur)}</span></div>`).join('')}</div>
-    <table class="table"><thead><tr><th>${t('rep.period')}</th><th class="num">${t('rep.receipts')}</th><th class="num">${t('rep.tax')}</th><th class="num">${t('col.total')}</th></tr></thead><tbody>
-    ${R.rows.map((r) => `<tr><td>${esc(periodLabel(r.key, p))}</td><td class="num">${r.count}</td><td class="num">${fmtMoney(r.taxMinor, cur)}</td><td class="num">${fmtMoney(r.totalMinor, cur)}</td></tr>`).join('')}</tbody></table>
+    ${chart}
     <h2>${t('rep.byStore')}</h2>
-    <table class="table"><thead><tr><th>${t('col.store')}</th><th class="num">${t('rep.receipts')}</th><th class="num">${t('col.total')}</th></tr></thead><tbody>
-    ${R.byStore.map((s) => `<tr><td>${esc(s.name)}</td><td class="num">${s.count}</td><td class="num">${fmtMoney(s.totalMinor, cur)}</td></tr>`).join('')}</tbody></table>`;
+    <table class="table"><thead><tr><th>${t('col.store')}</th><th class="num">${t('rep.receipts')}</th><th class="num">${t('rep.share')}</th><th class="num">${t('col.total')}</th></tr></thead><tbody>
+    ${R.byStore.map((s) => `<tr><td>${esc(s.name)}</td><td class="num">${s.count}</td><td class="num">${share(s.totalMinor, R.totals.totalMinor)}</td><td class="num">${fmtMoney(s.totalMinor, cur)}</td></tr>`).join('')}</tbody></table>
+    ${byCategory}
+    <h2>${t('rep.list')}</h2>
+    <table class="table clickable"><thead><tr><th>${t('col.date')}</th><th>${t('col.id')}</th><th>${t('col.store')}</th><th class="num">${t('col.total')}</th></tr></thead><tbody>
+    ${R.receipts.map((r) => `<tr data-action="open" data-key="${esc(r.key)}"><td>${fmtDateTime(r.purchasedAt)}</td><td class="mono">${esc(r.id)}</td><td>${storeLabel(r)}</td><td class="num">${fmtMoney(receiptTotals(r).total, cur)}</td></tr>`).join('')}</tbody></table>`;
 }
 
 // ---------- stores ----------
@@ -365,6 +466,20 @@ function storesHtml() {
     ${e ? `<button class="btn" data-action="storeCancel">${t('common.cancel')}</button>` : ''}</div></div>${rows}`;
 }
 
+// ---------- categories ----------
+function categoriesHtml() {
+  const e = S.catEdit;
+  const rows = S.categories.length ? `<table class="table"><thead><tr><th>${t('categories.name')}</th><th></th></tr></thead><tbody>
+    ${S.categories.map((c) => `<tr><td>${esc(c.name)}</td><td class="num"><button class="btn small" data-action="catEdit" data-id="${esc(c.id)}">${t('common.edit')}</button>
+    <button class="btn small danger" data-action="catDelete" data-id="${esc(c.id)}">${t('common.delete')}</button></td></tr>`).join('')}</tbody></table>`
+    : `<p class="empty">${t('categories.empty')}</p>`;
+  return `<header class="head"><h1>${t('categories.title')}</h1></header><p class="muted">${t('categories.intro')}</p>
+    <div class="form card"><h2>${e ? t('categories.editTitle') : t('categories.add')}</h2>
+    <label class="field"><span>${t('categories.name')}</span><input id="catName" type="text" value="${esc(e ? e.name : '')}"></label>
+    <div class="row"><button class="btn primary" data-action="catSave">${t('common.save')}</button>
+    ${e ? `<button class="btn" data-action="catCancel">${t('common.cancel')}</button>` : ''}</div></div>${rows}`;
+}
+
 // ---------- settings ----------
 function settingsHtml() {
   return `<header class="head"><h1>${t('settings.title')}</h1></header>
@@ -373,46 +488,77 @@ function settingsHtml() {
     <button class="btn" data-action="openFolder">${t('settings.open')}</button>
     <button class="btn" data-action="import">${t('list.import')}</button></div></section>
     <section class="card"><h2>${t('settings.language')}</h2>${langSelect()}</section>
-    <section class="card"><h2>${t('settings.version')}</h2><p class="mono">${esc(S.version)}</p></section>`;
+    <section class="card"><h2>${t('settings.appearance')}</h2><label class="field inline"><span>${t('settings.theme')}</span>
+      <select id="themeSel">${['system', 'light', 'dark'].map((v) => `<option value="${v}"${S.theme === v ? ' selected' : ''}>${t('theme.' + v)}</option>`).join('')}</select></label></section>
+    ${S.updateRepo ? `<section class="card"><h2>${t('settings.updates')}</h2>
+      <label class="check"><input id="updSwitch" type="checkbox"${S.checkUpdates ? ' checked' : ''}> ${t('settings.checkUpdates')}</label>
+      <p class="muted">${t('settings.updatesHelp')}</p></section>` : ''}
+    <section class="card"><h2>${t('settings.version')}</h2><p><span class="mono">${esc(S.version)}</span> <span data-update-slot>${updateNoteHtml()}</span></p></section>`;
 }
 
 // ---------- events ----------
-// Tax-rate menu. The browser's own <datalist> hides every entry that does not match what is already typed
-// (with "19" in the field, 0 and 7 disappeared), so this small menu always lists all rates.
-const taxMenu = {
-  target: null,
-  open(input) {
-    const m = $('#taxMenu');
+// ---------- categories ----------
+// Categories are saved by the user in the Categories menu. The list is the source of truth; the combo
+// menu in the receipt form shows these names. Items may still carry a category that was typed before
+// it was saved (or on another computer): it is kept as-is and shown in the field.
+const categoryOptions = () => S.categories.map((c) => c.name);
+// "groceries" typed by hand becomes "Groceries" when that spelling already exists, so categories do not split by case.
+const canonicalCategory = (typed) => {
+  const c = String(typed || '').trim();
+  return categoryOptions().find((x) => x.toLowerCase() === c.toLowerCase()) || c;
+};
+
+// ---------- tax-rate and category menus ----------
+// The browser's own <datalist> hides every entry that does not match what is already typed (with "19" in the
+// field, 0 and 7 disappeared). This small menu shows all entries when a field is focused or clicked, and
+// filters the category list only while the user is typing.
+const combo = {
+  target: null, picking: false,
+  entries(input) {
+    return TAX_RATES.map((r) => ({ value: pctToInput(r), label: `${fmtPct(r)} %` }));
+  },
+  open(input, filter = '') {
+    const m = $('#comboMenu');
     if (!m) return;
+    const all = this.entries(input);
+    const typed = filter.trim(); const f = typed.toLowerCase();
+    const list = all.filter((e) => !f || e.label.toLowerCase().includes(f));
+    const html = list.map((e) => `<button type="button" data-action="pickOption" data-value="${esc(e.value)}">${esc(e.label)}</button>`).join('');
+    if (!html) { this.close(); return; }
     this.target = input;
-    m.innerHTML = TAX_RATES.map((r) => `<button type="button" data-action="pickTax" data-rate="${r}">${fmtPct(r)} %</button>`).join('');
+    m.innerHTML = html;
     const b = input.getBoundingClientRect();
     m.style.left = `${b.left}px`; m.style.top = `${b.bottom + 2}px`; m.style.minWidth = `${b.width}px`;
     m.hidden = false;
   },
-  close() { const m = $('#taxMenu'); if (m) m.hidden = true; this.target = null; },
+  close() { const m = $('#comboMenu'); if (m) m.hidden = true; this.target = null; },
 };
+const isCombo = (el) => !!(el && el.classList && el.classList.contains('i-tax'));
 
 const actions = {
   // 'new' is not a view of its own: the sidebar entry opens an empty form (this was broken in 1.0).
-  nav: (d) => { S.editing = null; S.storeEdit = null; go(d.view === 'new' ? 'form' : d.view); },
+  nav: (d) => { S.editing = null; S.storeEdit = null; S.catEdit = null; go(d.view === 'new' ? 'form' : d.view); },
   new: () => { S.editing = null; go('form'); },
-  open: (d) => { S.selectedKey = d.key; go('detail'); },
+  open: (d) => { S.backView = S.view === 'report' ? 'report' : 'list'; S.selectedKey = d.key; go('detail'); },
   edit: (d) => { S.editing = S.receipts.find((r) => r.key === d.key) || null; go('form'); },
   cancelForm: () => { const back = S.editing ? 'detail' : 'list'; if (S.editing) S.selectedKey = S.editing.key; S.editing = null; go(back); },
   saveForm,
   addRow: () => {
+    // A new row starts with the tax rate and category of the row above.
     const prev = $$('#items .i-tax').pop();
+    const prevCat = $$('#items .i-cat').pop();
     const rate = prev ? parsePercent(prev.value) : lastRate();
-    $('#items tbody').insertAdjacentHTML('beforeend', itemRowHtml(emptyItem(Number.isNaN(rate) ? null : rate), $('#cur').value.trim().toUpperCase() || 'EUR'));
+    $('#items tbody').insertAdjacentHTML('beforeend', itemRowHtml(emptyItem(Number.isNaN(rate) ? null : rate, prevCat ? prevCat.value : ''), $('#cur').value.trim().toUpperCase() || 'EUR'));
     $$('#items .i-name').pop().focus(); updateTotals();
   },
-  pickTax: (d) => {
-    const input = taxMenu.target;
+  pickOption: (d) => {
+    const input = combo.target;
     if (!input) return;
-    input.value = pctToInput(Number(d.rate));
-    taxMenu.close();
-    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.value = d.value;
+    combo.close();
+    combo.picking = true;
+    input.dispatchEvent(new Event('input', { bubbles: true }));   // updates the totals
+    combo.picking = false;
   },
   removeRow: (_d, el) => { if ($$('#items .item-row').length > 1) el.closest('tr').remove(); else el.closest('tr').querySelectorAll('input').forEach((i) => { i.value = ''; }); updateTotals(); },
   delete: async (d) => {
@@ -420,7 +566,7 @@ const actions = {
     if (!r || !confirm(t('detail.confirmDelete', { id: r.id }))) return;
     const res = await api.deleteReceipt(d.key);
     if (res.error) return toast(res.error, true);
-    await reload(); go('list'); toast(t('toast.deleted', { id: r.id }));
+    await reload(); go(S.backView); toast(t('toast.deleted', { id: r.id }));
   },
   import: async () => {
     const res = await api.importReceipts();
@@ -437,12 +583,18 @@ const actions = {
   },
   openFolder: () => api.openFolder(),
   exportCsv: async () => {
-    const R = currentReport(); const p = S.report.period;
-    const text = reportToCsv(R.rows, (k) => periodLabel(k, p), R.currency, digits(R.currency), getLang(),
-      [t('csv.period'), t('csv.receipts'), t('csv.tax'), t('csv.total'), t('csv.currency')]);
-    const res = await api.exportCsv(text, t('rep.csvName', { period: p }));
+    const R = buildReport(S.receipts, S.report);
+    const text = receiptsToCsv(R.receipts, R.currency, digits(R.currency), getLang(),
+      [t('csv.id'), t('csv.date'), t('csv.store'), t('csv.location'), t('csv.tax'), t('csv.total'), t('csv.currency')]);
+    const res = await api.exportCsv(text, t('rep.csvName', { key: R.key }));
     if (res.ok) toast(t('toast.csv'));
   },
+  repPeriod: (d) => { S.report.period = d.period; render(); },
+  repPrev: () => { S.report.anchor = shiftAnchor(S.report.period, S.report.anchor, -1); render(); },
+  repNext: () => { S.report.anchor = shiftAnchor(S.report.period, S.report.anchor, 1); render(); },
+  repToday: () => { S.report.anchor = todayISO(); render(); },
+  repDrill: (d) => { S.report.period = d.period; S.report.anchor = d.anchor; render(); },
+  openRelease: () => api.openRelease(),
   storeSave: async () => {
     const name = $('#stName').value.trim();
     if (!name) return toast(t('err.store'), true);
@@ -456,10 +608,23 @@ const actions = {
     if (!s || !confirm(t('stores.confirmDelete', { name: s.name }))) return;
     S.stores = await api.deleteStore(d.id); S.storeEdit = null; render();
   },
+  catSave: async () => {
+    const name = $('#catName').value.trim();
+    if (!name) return toast(t('err.category'), true);
+    S.categories = await api.upsertCategory({ id: S.catEdit ? S.catEdit.id : undefined, name });
+    S.catEdit = null; render();
+  },
+  catEdit: (d) => { S.catEdit = S.categories.find((c) => c.id === d.id) || null; render(); },
+  catCancel: () => { S.catEdit = null; render(); },
+  catDelete: async (d) => {
+    const c = S.categories.find((x) => x.id === d.id);
+    if (!c || !confirm(t('categories.confirmDelete', { name: c.name }))) return;
+    S.categories = await api.deleteCategory(d.id); S.catEdit = null; render();
+  },
 };
 
 document.addEventListener('click', async (e) => {
-  if (e.target.classList && e.target.classList.contains('i-tax')) taxMenu.open(e.target);
+  if (isCombo(e.target)) combo.open(e.target);
   const el = e.target.closest('[data-action]');
   if (!el) return;
   const fn = actions[el.dataset.action];
@@ -471,24 +636,38 @@ document.addEventListener('input', (e) => {
     S.filters[el.dataset.filter] = el.value;
     $('#listBody').innerHTML = listBodyHtml();
   }
-  if (el.classList && el.classList.contains('i-tax')) taxMenu.close();   // typing: hide the menu, a click shows it again
+  // Typing in a tax rate hides the menu (a click shows it again).
+  if (isCombo(el) && !combo.picking) combo.close();
+  // Choosing "+ New category…" shows the free-text field next to the select.
+  if (el.classList && el.classList.contains('i-cat')) {
+    const row = el.closest('.item-row');
+    const blk = row && row.querySelector('.i-cat-newblk');
+    if (blk) blk.hidden = el.value !== '__new__';
+  }
   if (el.closest && el.closest('#receiptForm')) updateTotals();
 });
 document.addEventListener('focusin', (e) => {
-  if (e.target.classList && (e.target.classList.contains('i-tax') || e.target.classList.contains('i-disc'))) e.target.select();
-  if (e.target.classList && e.target.classList.contains('i-tax')) taxMenu.open(e.target);
+  if (e.target.classList && e.target.classList.contains('i-disc')) e.target.select();
+  if (isCombo(e.target)) { e.target.select(); combo.open(e.target); }
 });
-document.addEventListener('focusout', (e) => { if (e.target.classList && e.target.classList.contains('i-tax')) taxMenu.close(); });
+document.addEventListener('focusout', (e) => { if (isCombo(e.target)) combo.close(); });
 // Pressing a menu entry must not take the focus away from the field, or the menu would close before the click.
-document.addEventListener('mousedown', (e) => { if (e.target.closest && e.target.closest('#taxMenu')) e.preventDefault(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') taxMenu.close(); });
-window.addEventListener('scroll', () => taxMenu.close(), true);
-window.addEventListener('resize', () => taxMenu.close());
+document.addEventListener('mousedown', (e) => { if (e.target.closest && e.target.closest('#comboMenu')) e.preventDefault(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') combo.close(); });
+// The page scrolling moves the field away from the menu, so the menu closes. Scrolling inside the menu itself must not.
+window.addEventListener('scroll', (e) => { if (e.target && e.target.closest && e.target.closest('#comboMenu')) return; combo.close(); }, true);
+window.addEventListener('resize', () => combo.close());
 document.addEventListener('change', async (e) => {
   const el = e.target;
   if (el.id === 'langSel') { applyState(await api.setLanguage(el.value)); render(); }
+  else if (el.id === 'themeSel') applyState(await api.setTheme(el.value));
+  else if (el.id === 'updSwitch') { applyState(await api.setCheckUpdates(el.checked)); refreshUpdateNote(); }
   else if (el.id === 'storeSel') { $('#newStore').hidden = el.value !== '__new__'; }
-  else if (el.dataset && el.dataset.rep) { S.report[el.dataset.rep] = el.value; render(); }
+  else if (el.classList && el.classList.contains('i-cat')) {
+    const row = el.closest('.item-row'); const blk = row && row.querySelector('.i-cat-newblk');
+    if (blk) blk.hidden = el.value !== '__new__';
+  }
+  else if (el.dataset && el.dataset.rep) setReport(el.dataset.rep, el.value);
 });
 
 init();

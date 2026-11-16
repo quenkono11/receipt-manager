@@ -1,16 +1,22 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, nativeTheme } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
 const crypto = require('crypto');
 const chokidar = require('chokidar');
 const F = require('./lib/folder');
+const U = require('./lib/update');
+const pkg = require('./package.json');
 
 const STORES_FILE = F.STORES_FILE;
+const CATEGORIES_FILE = F.CATEGORIES_FILE;
 let mainWindow = null;
 let watcher = null;
-let config = { folder: null, language: null };
+let config = { folder: null, language: null, theme: 'system', checkUpdates: true };
+// The GitHub repository comes from the "repository" field of package.json; without it there is no update check.
+const updateRepo = U.repoFromPackage(pkg);
+let updateInfo = null;   // { version, url } when a newer release exists
 
 // Texts for native dialogs (the web UI has its own translations).
 const MSG = {
@@ -47,7 +53,23 @@ async function folderOk(folder) {
   try { await fsp.access(folder, fs.constants.R_OK | fs.constants.W_OK); return true; } catch { return false; }
 }
 async function getState() {
-  return { folder: config.folder, language: lang(), folderOk: await folderOk(config.folder), version: app.getVersion() };
+  return {
+    folder: config.folder, language: lang(), folderOk: await folderOk(config.folder), version: app.getVersion(),
+    theme: config.theme, checkUpdates: config.checkUpdates !== false, updateRepo: !!updateRepo, update: updateInfo,
+  };
+}
+
+// ---------- theme and updates ----------
+// nativeTheme drives "prefers-color-scheme" in the page, so the CSS needs no extra switch, and native dialogs follow too.
+const THEMES = ['system', 'light', 'dark'];
+const applyTheme = () => { nativeTheme.themeSource = THEMES.includes(config.theme) ? config.theme : 'system'; };
+const sendToWindow = (channel, payload) => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+};
+async function checkUpdates() {
+  updateInfo = null;
+  if (config.checkUpdates !== false && updateRepo) updateInfo = await U.checkForUpdate({ repo: updateRepo, current: app.getVersion() });
+  sendToWindow('update:info', updateInfo);
 }
 
 // ---------- file helpers ----------
@@ -97,6 +119,25 @@ ipcMain.handle('app:setLanguage', async (_e, value) => {
   config.language = value === 'de' ? 'de' : 'en';
   saveConfig();
   return getState();
+});
+
+ipcMain.handle('app:setTheme', async (_e, value) => {
+  config.theme = THEMES.includes(value) ? value : 'system';
+  saveConfig(); applyTheme();
+  return getState();
+});
+
+ipcMain.handle('app:setCheckUpdates', async (_e, on) => {
+  config.checkUpdates = !!on;
+  saveConfig();
+  updateInfo = null;
+  if (config.checkUpdates) checkUpdates(); else sendToWindow('update:info', null);
+  return getState();
+});
+
+// Opens the release page of the update that was found. The address comes from here, never from the page.
+ipcMain.handle('update:open', () => {
+  if (updateInfo && typeof updateInfo.url === 'string' && updateInfo.url.startsWith('https://github.com/')) shell.openExternal(updateInfo.url);
 });
 
 ipcMain.handle('folder:choose', async () => {
@@ -187,6 +228,39 @@ ipcMain.handle('stores:delete', async (_e, id) => {
   return stores;
 });
 
+// ---------- categories ----------
+async function readCategories() {
+  try {
+    const data = JSON.parse(await fsp.readFile(path.join(config.folder, CATEGORIES_FILE), 'utf8'));
+    return Array.isArray(data.categories) ? data.categories.filter(c => c && c.id && c.name) : [];
+  } catch { return []; }
+}
+const writeCategories = (categories) =>
+  writeJsonAtomic(path.join(config.folder, CATEGORIES_FILE), { schemaVersion: 1, categories });
+
+ipcMain.handle('categories:list', async () => (config.folder ? readCategories() : []));
+
+ipcMain.handle('categories:upsert', async (_e, cat) => {
+  const categories = await readCategories();
+  const name = String(cat.name || '').trim();
+  if (!name) return categories;
+  if (cat.id) {
+    const c = categories.find(x => x.id === cat.id);
+    if (c) c.name = name;
+  } else if (!categories.some(c => c.name.toLowerCase() === name.toLowerCase())) {
+    categories.push({ id: 'c_' + crypto.randomBytes(5).toString('hex'), name });
+  }
+  categories.sort((a, b) => a.name.localeCompare(b.name));
+  await writeCategories(categories);
+  return categories;
+});
+
+ipcMain.handle('categories:delete', async (_e, id) => {
+  const categories = (await readCategories()).filter(c => c.id !== id);
+  await writeCategories(categories);
+  return categories;
+});
+
 ipcMain.handle('export:csv', async (_e, text, name) => {
   const res = await dialog.showSaveDialog(mainWindow, {
     title: msg().csvTitle,
@@ -200,8 +274,12 @@ ipcMain.handle('export:csv', async (_e, text, name) => {
 
 // ---------- window ----------
 function createWindow() {
+  // The window is created hidden and shown once it is maximized, so it never flashes up small first.
+  // Maximized, not fullscreen: title bar and panel stay visible. width/height apply when the user un-maximizes.
   mainWindow = new BrowserWindow({
     width: 1100, height: 760, minWidth: 880, minHeight: 600,
+    show: false,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#161c22' : '#e8ecee',
     title: 'Receipt Manager',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -210,12 +288,19 @@ function createWindow() {
       sandbox: true,
     },
   });
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.maximize();
+    mainWindow.show();
+    if (!mainWindow.isMaximized()) mainWindow.maximize();   // some Linux window managers ignore maximize() on a hidden window
+  });
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  mainWindow.webContents.once('did-finish-load', () => { checkUpdates(); });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
 app.whenReady().then(() => {
   loadConfig();
+  applyTheme();
   createWindow();
   startWatcher();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

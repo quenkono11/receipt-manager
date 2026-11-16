@@ -119,8 +119,39 @@ details.banner ul { margin: 8px 0 0; padding-left: 18px; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 
-/* tax-rate menu in the receipt form */
-.tax-menu { position: fixed; z-index: 50; display: flex; flex-direction: column; padding: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14); }
-.tax-menu[hidden] { display: none; }
-.tax-menu button { background: none; border: 0; border-radius: 6px; padding: 6px 14px; font: inherit; color: inherit; text-align: left; cursor: pointer; }
-.tax-menu button:hover { background: var(--line); }
+/* menu for tax rates and categories in the receipt form */
+.combo-menu { position: fixed; z-index: 50; display: flex; flex-direction: column; max-height: 240px; overflow-y: auto; overscroll-behavior: contain; padding: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14); }
+.combo-menu[hidden] { display: none; }
+.combo-menu button { background: none; border: 0; border-radius: 6px; padding: 6px 14px; font: inherit; color: inherit; text-align: left; cursor: pointer; white-space: nowrap; }
+.combo-menu button:hover { background: var(--line); }
+.combo-menu .create { color: var(--accent); }
+.combo-hint { padding: 6px 14px; font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+/* Category select and "+ New category…" block in the receipt form.
+   The block is rendered once and its visibility is driven by the select's value (state-driven),
+   the same mechanism as #newStore. */
+.table.items .i-cat-cell { width: 300px; display: flex; flex-direction: column; gap: 6px; }
+.table.items .i-cat { width: 100%; min-width: 0; }
+.table.items .i-cat-newblk { display: flex; flex-direction: row; gap: 8px; align-items: center; }
+.table.items .i-cat-new { flex: 1 1 220px; min-width: 0; min-height: 31px; padding: 7px 9px; }
+.table.items .i-cat-newblk[hidden] { display: none; }
+
+/* overview: one chosen period */
+.period-bar { display: flex; gap: 12px 16px; align-items: center; flex-wrap: wrap; }
+.seg { display: inline-flex; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg-btn { background: none; border: 0; border-right: 1px solid var(--line); padding: 7px 14px; color: var(--ink); cursor: pointer; }
+.seg-btn:last-child { border-right: 0; }
+.seg-btn:not(.on):hover { background: var(--desk); }
+.seg-btn.on { background: var(--accent); color: var(--accent-ink); }
+.period-title { font-size: 18px; margin: 16px 0 12px; }
+.stat-sub { font-size: 12px; margin-top: 2px; }
+.cols { display: grid; grid-template-columns: repeat(var(--n), minmax(0, 1fr)); gap: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px 8px; margin-bottom: 14px; }
+.col { display: grid; grid-template-rows: 150px auto; gap: 4px; min-width: 0; background: none; border: 0; padding: 0; color: inherit; cursor: pointer; }
+.col-area { display: flex; align-items: flex-end; }
+.col-bar { display: block; width: 100%; background: var(--bar); border-radius: 3px 3px 0 0; }
+.col-bar.zero { height: 2px !important; background: var(--line); }
+.col:hover .col-bar:not(.zero) { filter: brightness(1.15); }
+.col-label { text-align: center; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* "Version x.y.z is available" */
+.link-btn { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); text-decoration: underline; cursor: pointer; text-align: left; }
+.side-foot .link-btn { margin-top: 2px; }

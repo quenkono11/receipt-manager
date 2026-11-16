@@ -77,16 +77,107 @@ for (const [s, want] of [['12,50', 1250], ['12.50', 1250], ['1.234,56', 123456],
 assert.equal(fmt.parseMoney('abc', 'EUR'), null);
 assert.equal(fmt.parseMoney('1500', 'JPY'), 1500);
 
-// ---------- weeks, periods, reports ----------
+// ---------- periods ----------
 assert.equal(rep.periodKey('2026-01-01', 'week'), '2026-W01');
 assert.equal(rep.periodKey('2024-12-30', 'week'), '2025-W01');
 assert.equal(rep.periodKey('2021-01-03', 'week'), '2020-W53');
 assert.equal(rep.periodKey('2026-05-17T10:00', 'quarter'), '2026-Q2');
-const mk = (date, store, cents, cur = 'EUR') => ({ purchasedAt: date, currency: cur, store: { name: store }, items: [item('x', 1, cents)] });
-const list = [mk('2026-01-05T10:00', 'A', 1000), mk('2026-01-20T10:00', 'B', 500), mk('2026-02-02T10:00', 'A', 250), mk('2026-02-03T10:00', 'A', 99, 'USD')];
-const out = rep.buildReport(list, { period: 'month', from: '2026-01-01', to: '2026-12-31', currency: 'EUR' });
-assert.deepEqual(out.rows.map((x) => [x.key, x.totalMinor]), [['2026-01', 1500], ['2026-02', 250]]);
-assert.equal(out.byStore[0].name, 'A'); assert.equal(out.currencies.length, 2); assert.equal(out.totals.count, 3);
+assert.deepEqual(rep.periodRange('day', '2026-03-04'), { from: '2026-03-04', to: '2026-03-04' });
+// 1 Jan 2026 is a Thursday, so its week runs from Monday 29 Dec 2025 to Sunday 4 Jan 2026.
+assert.deepEqual(rep.periodRange('week', '2026-01-01'), { from: '2025-12-29', to: '2026-01-04' });
+assert.deepEqual(rep.periodRange('week', '2026-11-08'), { from: '2026-11-02', to: '2026-11-08' });   // a Sunday belongs to the week before
+assert.deepEqual(rep.periodRange('month', '2024-02-10'), { from: '2024-02-01', to: '2024-02-29' });
+assert.deepEqual(rep.periodRange('month', '2026-02-10'), { from: '2026-02-01', to: '2026-02-28' });
+assert.deepEqual(rep.periodRange('quarter', '2026-11-07'), { from: '2026-10-01', to: '2026-12-31' });
+assert.deepEqual(rep.periodRange('quarter', '2026-03-31'), { from: '2026-01-01', to: '2026-03-31' });
+assert.deepEqual(rep.periodRange('year', '2026-06-15'), { from: '2026-01-01', to: '2026-12-31' });
+assert.equal(rep.isoWeekStart(2026, 45), '2026-11-02'); assert.equal(rep.isoWeekStart(2026, 1), '2025-12-29');
+assert.equal(rep.isoWeekStart(2020, 53), '2020-12-28');
+// Moving to the previous / next period crosses month and year boundaries correctly.
+assert.equal(rep.shiftAnchor('month', '2026-01-15', -1), '2025-12-01');
+assert.equal(rep.shiftAnchor('month', '2026-12-31', 1), '2027-01-01');
+assert.equal(rep.shiftAnchor('quarter', '2026-02-01', -1), '2025-10-01');
+assert.equal(rep.shiftAnchor('year', '2026-05-05', 1), '2027-01-01');
+assert.equal(rep.shiftAnchor('week', '2026-01-01', -1), '2025-12-22');
+assert.equal(rep.shiftAnchor('day', '2026-03-01', -1), '2026-02-28');
+assert.deepEqual(rep.periodBuckets('day', rep.periodRange('day', '2026-03-04')), []);
+assert.equal(rep.periodBuckets('week', rep.periodRange('week', '2026-03-04')).length, 7);
+assert.equal(rep.periodBuckets('month', rep.periodRange('month', '2026-11-07')).length, 30);
+assert.equal(rep.periodBuckets('month', rep.periodRange('month', '2024-02-07')).length, 29);
+assert.equal(rep.periodBuckets('quarter', rep.periodRange('quarter', '2026-11-07')).length, 3);
+assert.deepEqual(rep.periodBuckets('year', rep.periodRange('year', '2026-11-07')).map((b) => b.key).slice(0, 2), ['2026-01', '2026-02']);
+
+// ---------- overview of one period ----------
+const mk = (date, store, cents, cur = 'EUR', category = '') =>
+  ({ id: 'REC-X', purchasedAt: date, currency: cur, store: { name: store, location: '' }, taxIncluded: true, items: [{ ...item('x', 1, cents, 0, 19), ...(category ? { category } : {}) }] });
+const list = [mk('2026-10-31T10:00', 'A', 1000), mk('2026-11-02T10:00', 'A', 500, 'EUR', 'Food'), mk('2026-11-02T18:00', 'B', 250, 'EUR', 'Food'),
+  mk('2026-11-20T10:00', 'A', 120, 'EUR', 'Home'), mk('2026-11-21T10:00', 'A', 99, 'USD'), mk('2026-12-01T10:00', 'A', 777)];
+let out = rep.buildReport(list, { period: 'month', anchor: '2026-11-15', currency: '' });
+assert.equal(out.key, '2026-11'); assert.equal(out.currency, 'EUR');
+assert.equal(out.totals.count, 3); assert.equal(out.totals.totalMinor, 870); assert.equal(out.average, 290);
+assert.equal(out.receipts.length, 3); assert.equal(out.buckets.length, 30);
+assert.equal(out.buckets.find((b) => b.key === '2026-11-02').totalMinor, 750);
+assert.equal(out.buckets.find((b) => b.key === '2026-11-03').totalMinor, 0);
+assert.equal(out.previous.totalMinor, 1000);                       // October, for the comparison
+assert.equal(out.currencies.length, 2);
+assert.deepEqual(out.byStore.map((x) => [x.name, x.totalMinor]), [['A', 620], ['B', 250]]);
+assert.deepEqual(out.byCategory.map((x) => [x.name, x.totalMinor]), [['Food', 750], ['Home', 120]]);
+out = rep.buildReport(list, { period: 'month', anchor: '2026-11-15', currency: 'USD' });
+assert.equal(out.totals.totalMinor, 99); assert.equal(out.receipts.length, 1);
+out = rep.buildReport(list, { period: 'year', anchor: '2026-06-01', currency: 'EUR' });
+assert.equal(out.buckets.length, 12); assert.equal(out.buckets[10].totalMinor, 870); assert.equal(out.buckets[11].totalMinor, 777);
+out = rep.buildReport(list, { period: 'day', anchor: '2026-11-02', currency: '' });
+assert.equal(out.buckets.length, 0); assert.equal(out.receipts.length, 2); assert.equal(out.totals.totalMinor, 750);
+out = rep.buildReport(list, { period: 'quarter', anchor: '2026-11-02', currency: '' });
+assert.equal(out.key, '2026-Q4'); assert.equal(out.buckets.length, 3); assert.equal(out.totals.totalMinor, 1000 + 870 + 777);
+// Without any category the category table is empty (categories are optional).
+assert.deepEqual(rep.buildReport([mk('2026-11-02T10:00', 'A', 100)], { period: 'month', anchor: '2026-11-02', currency: '' }).byCategory, []);
+out = rep.buildReport(list, { period: 'week', anchor: '2030-01-01', currency: '' });
+assert.equal(out.receipts.length, 0); assert.equal(out.currency, '');
+
+// ---------- CSV: one row per receipt ----------
+const csvRec = { ...mk('2026-11-02T10:00', 'Rewe, Mitte', 1190), id: 'REC-2026-00007' };
+let csv = rep.receiptsToCsv([csvRec], 'EUR', 2, 'en', ['ID', 'Date', 'Store', 'Location', 'Tax', 'Total', 'Currency']);
+assert.equal(csv, '\uFEFFID,Date,Store,Location,Tax,Total,Currency\r\nREC-2026-00007,2026-11-02 10:00,"Rewe, Mitte",,1.90,11.90,EUR\r\n');
+csv = rep.receiptsToCsv([csvRec], 'EUR', 2, 'de', ['ID', 'Datum', 'Geschäft', 'Ort', 'Steuer', 'Summe', 'Währung']);
+assert.ok(csv.includes('REC-2026-00007;2026-11-02 10:00;Rewe, Mitte;;1,90;11,90;EUR'));
+
+// ---------- categories ----------
+const withCat = lib.sanitizeReceipt({ store: { name: 'S' }, purchasedAt: '2026-03-04T12:30', currency: 'EUR', items: [
+  { ...item('a', 1, 100), category: '  Groceries ' }, { ...item('b', 1, 100), category: '   ' }, { ...item('c', 1, 100), category: 'x'.repeat(100) }] }, id, key, null);
+assert.equal(withCat.items[0].category, 'Groceries'); assert.ok(!('category' in withCat.items[1])); assert.equal(withCat.items[2].category.length, 60);
+assert.equal(lib.validateReceipt(withCat), null);
+// Category amounts add up to the receipt total when prices include tax; with added tax each item carries its own tax.
+const ir = { taxIncluded: true, discountPct: 10, items: [{ ...item('a', 1, 1000, 0, 19), category: 'A' }, { ...item('b', 3, 333, 20, 7), category: 'B' }] };
+assert.equal(fmt.itemAmounts(ir).reduce((s, x) => s + x.amount, 0), fmt.receiptTotals(ir).total);
+assert.deepEqual(fmt.itemAmounts({ taxIncluded: false, items: [item('a', 1, 1000, 0, 19)] }), [{ category: '', amount: 1190 }]);
+
+// ---------- update notice ----------
+const upd = require('../lib/update.js');
+assert.deepEqual(upd.parseVersion('v1.2.0'), [1, 2, 0]); assert.equal(upd.parseVersion('1.2.0-beta'), null); assert.equal(upd.parseVersion('x'), null);
+assert.ok(upd.isNewer('v1.2.0', '1.1.1')); assert.ok(upd.isNewer('1.10.0', '1.9.9')); assert.ok(upd.isNewer('2.0.0', '1.99.99'));
+assert.ok(!upd.isNewer('1.1.1', '1.1.1')); assert.ok(!upd.isNewer('1.0.9', '1.1.0')); assert.ok(!upd.isNewer('garbage', '1.1.0'));
+for (const r of ['github:me/receipt-manager', 'me/receipt-manager', 'https://github.com/me/receipt-manager', 'https://github.com/me/receipt-manager.git',
+  'git+https://github.com/me/receipt-manager.git', 'git@github.com:me/receipt-manager.git', { type: 'git', url: 'git+https://github.com/me/receipt-manager.git' }])
+  assert.equal(upd.repoFromPackage({ repository: r }), 'me/receipt-manager', JSON.stringify(r));
+for (const r of [undefined, '', 'gitlab:me/x', 'https://gitlab.com/me/x', 'justaword', { type: 'git' }, 'me/x/y'])
+  assert.equal(upd.repoFromPackage({ repository: r }), null, JSON.stringify(r));
+const fakeFetch = (body, ok = true) => async (url, opts) => {
+  assert.equal(url, 'https://api.github.com/repos/me/receipt-manager/releases/latest'); assert.ok(opts.headers['User-Agent']);
+  return { ok, json: async () => body };
+};
+const found = await upd.checkForUpdate({ repo: 'me/receipt-manager', current: '1.1.1', fetchFn: fakeFetch({ tag_name: 'v1.2.0', html_url: 'https://github.com/me/receipt-manager/releases/tag/v1.2.0' }) });
+assert.deepEqual(found, { version: '1.2.0', url: 'https://github.com/me/receipt-manager/releases/tag/v1.2.0' });
+const check = (body, ok) => upd.checkForUpdate({ repo: 'me/receipt-manager', current: '1.1.1', fetchFn: fakeFetch(body, ok) });
+assert.equal(await check({ tag_name: 'v1.1.1' }), null);                       // same version
+assert.equal(await check({ tag_name: 'v1.0.0' }), null);                       // older release online
+assert.equal(await check({ tag_name: 'v1.3.0', prerelease: true }), null);
+assert.equal(await check({ tag_name: 'v1.3.0', draft: true }), null);
+assert.equal(await check({ tag_name: 'v1.3.0' }, false), null);                // HTTP error / rate limit
+assert.deepEqual(await check({ tag_name: 'v1.3.0', html_url: 'https://evil.example/x' }), { version: '1.3.0', url: 'https://github.com/me/receipt-manager/releases/latest' });
+assert.equal(await upd.checkForUpdate({ repo: 'me/receipt-manager', current: '1.1.1', fetchFn: async () => { throw new Error('offline'); } }), null);
+assert.equal(await upd.checkForUpdate({ repo: null, current: '1.1.1', fetchFn: fakeFetch({}) }), null);
+assert.equal(await upd.checkForUpdate({ repo: '../../etc', current: '1.1.1', fetchFn: fakeFetch({}) }), null);
 
 // ---------- both languages define exactly the same keys ----------
 assert.deepEqual(Object.keys(en).sort(), Object.keys(de).sort());

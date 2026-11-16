@@ -126,3 +126,14 @@ export function receiptTotals(r) {
   const tax = taxByRate.reduce((s, g) => s + g.tax, 0) + legacyTax;
   return { subtotal, itemDiscount, receiptDiscount, taxByRate, legacyTax, tax, total: base + (included ? 0 : tax) };
 }
+
+// Amount of every item after its own discount and the receipt discount, plus its tax when prices exclude tax.
+// Used for the category totals in the overview. Rounding per item can differ from the receipt total by a few cents.
+export function itemAmounts(r) {
+  const recDisc = clampPct(r.discountPct);
+  return (r.items || []).map((i) => {
+    const net = rnd(itemLine(i).afterItem * (100 - recDisc) / 100);
+    const rate = pctOrNull(i.taxRatePct) ?? 0;
+    return { category: String(i.category || '').trim(), amount: r.taxIncluded ? net : net + rnd(net * rate / 100) };
+  });
+}

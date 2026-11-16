@@ -1,10 +1,11 @@
 {
   "name": "receipt-manager",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Receipt manager / Belegverwaltung",
   "main": "main.js",
   "author": "Receipt Manager",
   "license": "GPL-3.0-only",
+  "repository": "github:quenkono11/receipt-manager",
   "scripts": {
     "start": "electron .",
     "test": "node test/logic.test.mjs",
